@@ -1,0 +1,32 @@
+# Paper Trading Configuration
+# ============================
+# Relaxed limits for simulation/testing
+
+mode: paper
+platform: TWS
+account_id: ""  # Will be auto-detected
+
+connection:
+  host: "127.0.0.1"
+  port: 7497
+  client_id: 1
+  timeout: 10
+
+# Relaxed limits for paper trading (allows testing without restrictions)
+limits:
+  max_daily_loss: 100000.0
+  max_position_loss: 50000.0
+  max_order_size: 10000
+  max_order_value: 1000000.0
+  max_orders_per_session: 1000
+  max_orders_per_minute: 60
+  max_portfolio_exposure: 10000000.0
+  max_position_concentration: 1.0  # 100%
+  emergency_stop_loss: 1.0  # 100% (effectively disabled)
+  warning_threshold: 0.90
+
+# Features
+features:
+  require_confirmation: false
+  enable_notifications: false
+  strict_validation: false

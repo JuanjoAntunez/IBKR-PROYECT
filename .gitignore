@@ -30,6 +30,17 @@ logs/*.log
 
 # Credentials (NEVER commit)
 config/credentials.py
+config/credentials/
+config/live.yaml
+
+# Live Trading (NEVER commit)
+.live_trading_enabled
+.live_token_hash
+.env.live
+*.env.live
+
+# Audit logs (sensitive data)
+logs/audit_trades.jsonl
 
 # OS
 .DS_Store

@@ -1,0 +1,39 @@
+# Live Trading Configuration (TEMPLATE)
+# ======================================
+# COPY THIS FILE TO live.yaml AND CONFIGURE
+# WARNING: live.yaml should NEVER be committed to git!
+
+mode: live
+platform: TWS
+account_id: ""  # Your IB account ID
+
+connection:
+  host: "127.0.0.1"
+  port: 7496
+  client_id: 1
+  timeout: 15
+
+# STRICT limits for live trading - adjust carefully!
+limits:
+  max_daily_loss: 1000.0  # Maximum daily loss in USD
+  max_position_loss: 500.0  # Maximum loss per position
+  max_order_size: 100  # Maximum shares per order
+  max_order_value: 5000.0  # Maximum order value in USD
+  max_orders_per_session: 50  # Maximum orders per session
+  max_orders_per_minute: 5  # Rate limit
+  max_portfolio_exposure: 50000.0  # Total portfolio value limit
+  max_position_concentration: 0.20  # Max 20% in single position
+  emergency_stop_loss: 0.05  # Kill switch at 5% account loss
+  warning_threshold: 0.80  # Warn at 80% of limits
+
+# Features - all enabled for live trading
+features:
+  require_confirmation: true  # Require confirmation for each order
+  enable_notifications: true  # Send alerts
+  strict_validation: true  # Enforce all limits
+
+# Notifications (optional - configure in environment variables)
+notifications:
+  email_enabled: false
+  sms_enabled: false
+  slack_enabled: false
