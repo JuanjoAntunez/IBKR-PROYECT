@@ -61,10 +61,10 @@ st.markdown("""
 
 
 # =============================================================================
-# Clase IBApp - EXACTA de test_ibapi.py
+# Clase IBApp - EXACTA de test_ibapi.py + Portfolio
 # =============================================================================
 class IBApp(EWrapper, EClient):
-    """Aplicacion simple de IB API - MISMA que test_ibapi.py."""
+    """Aplicacion simple de IB API - MISMA que test_ibapi.py + Portfolio."""
 
     def __init__(self):
         EClient.__init__(self, self)
@@ -75,6 +75,11 @@ class IBApp(EWrapper, EClient):
         self.historical_data = []
         self.data_end = False
         self.debug_messages = []
+        # Portfolio
+        self.portfolio_items = []
+        self.portfolio_end = False
+        self.account_values = {}
+        self.account_update_end = False
 
     def _log(self, msg):
         """Log interno para debug."""
@@ -114,6 +119,7 @@ class IBApp(EWrapper, EClient):
     def accountSummaryEnd(self, reqId):
         """Fin del resumen de cuenta."""
         self._log("accountSummaryEnd recibido")
+        self.account_update_end = True
 
     def historicalData(self, reqId, bar):
         """Recibe datos históricos."""
@@ -130,6 +136,44 @@ class IBApp(EWrapper, EClient):
         """Fin de datos históricos."""
         self._log(f"historicalDataEnd: {len(self.historical_data)} barras recibidas")
         self.data_end = True
+
+    # =========================================================================
+    # Portfolio callbacks
+    # =========================================================================
+    def updatePortfolio(self, contract, position, marketPrice, marketValue,
+                        averageCost, unrealizedPNL, realizedPNL, accountName):
+        """Recibe actualizaciones del portfolio."""
+        self.portfolio_items.append({
+            'symbol': contract.symbol,
+            'secType': contract.secType,
+            'exchange': contract.exchange,
+            'currency': contract.currency,
+            'position': position,
+            'marketPrice': marketPrice,
+            'marketValue': marketValue,
+            'averageCost': averageCost,
+            'unrealizedPNL': unrealizedPNL,
+            'realizedPNL': realizedPNL,
+            'account': accountName
+        })
+        self._log(f"Portfolio: {contract.symbol} pos={position} mktVal={marketValue:.2f} unrealPNL={unrealizedPNL:.2f}")
+
+    def updateAccountValue(self, key, val, currency, accountName):
+        """Recibe valores de cuenta (más detallados que accountSummary)."""
+        self.account_values[key] = {
+            'value': val,
+            'currency': currency,
+            'account': accountName
+        }
+
+    def updateAccountTime(self, timeStamp):
+        """Timestamp de la última actualización de cuenta."""
+        self._log(f"Account update time: {timeStamp}")
+
+    def accountDownloadEnd(self, accountName):
+        """Fin de descarga de datos de cuenta."""
+        self._log(f"accountDownloadEnd para {accountName}")
+        self.portfolio_end = True
 
 
 # =============================================================================
@@ -198,6 +242,92 @@ def get_account_summary(app, timeout=5):
         app.reqAccountSummary(1, "All", "NetLiquidation,TotalCashValue,AvailableFunds")
         time.sleep(timeout)
     return app.account_info
+
+
+def fetch_portfolio(host, port, client_id):
+    """
+    Obtiene el portfolio completo y resumen de cuenta.
+
+    Returns:
+        tuple: (portfolio_data, account_data, error_message, debug_messages)
+    """
+    debug = []
+    debug.append(f"Solicitando portfolio de {host}:{port}")
+
+    # Conectar
+    app, error, conn_debug = connect_to_ib(host, port, client_id)
+    debug.extend(conn_debug)
+
+    if error:
+        return None, None, error, debug
+
+    try:
+        # Limpiar datos anteriores
+        app.portfolio_items = []
+        app.account_values = {}
+        app.account_info = {}
+        app.portfolio_end = False
+        app.account_update_end = False
+
+        # Solicitar Account Summary con todos los tags importantes
+        account_tags = (
+            "NetLiquidation,TotalCashValue,SettledCash,"
+            "AccruedCash,BuyingPower,EquityWithLoanValue,"
+            "GrossPositionValue,RegTEquity,RegTMargin,"
+            "InitMarginReq,MaintMarginReq,AvailableFunds,"
+            "ExcessLiquidity,Cushion,FullInitMarginReq,"
+            "FullMaintMarginReq,FullAvailableFunds,FullExcessLiquidity,"
+            "LookAheadNextChange,LookAheadInitMarginReq,LookAheadMaintMarginReq,"
+            "LookAheadAvailableFunds,LookAheadExcessLiquidity,"
+            "HighestSeverity,DayTradesRemaining,Leverage,"
+            "RealizedPnL,UnrealizedPnL"
+        )
+
+        debug.append("Solicitando reqAccountSummary...")
+        app.reqAccountSummary(1, "All", account_tags)
+
+        # Solicitar portfolio (posiciones)
+        if app.accounts:
+            account = app.accounts[0].strip()
+            debug.append(f"Solicitando reqAccountUpdates para {account}...")
+            app.reqAccountUpdates(True, account)
+
+        # Esperar datos
+        timeout = 15
+        start_time = time.time()
+        while not app.portfolio_end and (time.time() - start_time) < timeout:
+            time.sleep(0.1)
+
+        # Dar tiempo extra para account summary
+        time.sleep(2)
+
+        elapsed = time.time() - start_time
+        debug.append(f"Espera terminada después de {elapsed:.1f}s")
+        debug.append(f"Portfolio items: {len(app.portfolio_items)}")
+        debug.append(f"Account values: {len(app.account_values)}")
+        debug.append(f"Account info: {len(app.account_info)}")
+        debug.extend(app.debug_messages)
+
+        # Cancelar suscripciones
+        app.reqAccountUpdates(False, "")
+        app.cancelAccountSummary(1)
+
+        # Preparar datos
+        portfolio_data = app.portfolio_items if app.portfolio_items else []
+
+        # Combinar account_info y account_values
+        account_data = {**app.account_info, **app.account_values}
+
+        return portfolio_data, account_data, None, debug
+
+    except Exception as e:
+        debug.append(f"✗ Error: {e}")
+        return None, None, str(e), debug
+
+    finally:
+        if app and app.isConnected():
+            app.disconnect()
+            debug.append("Desconectado")
 
 
 def create_contract(symbol):
@@ -483,7 +613,7 @@ def main():
     st.markdown("---")
 
     # Pestañas
-    tab1, tab2, tab3 = st.tabs(["📈 Datos Históricos", "🔧 Test Conexión", "🐛 Debug"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📈 Datos Históricos", "💼 Portfolio", "🔧 Test Conexión", "🐛 Debug"])
 
     # =========================================================================
     # TAB 1: Datos Históricos
@@ -599,9 +729,278 @@ def main():
             st.info("👆 Ingresa un símbolo y haz clic en 'Obtener Datos' para comenzar")
 
     # =========================================================================
-    # TAB 2: Test Conexión
+    # TAB 2: Portfolio
     # =========================================================================
     with tab2:
+        st.subheader("💼 Portfolio y Resumen de Cuenta")
+
+        # Inicializar estado de portfolio
+        if 'portfolio_data' not in st.session_state:
+            st.session_state.portfolio_data = None
+        if 'account_data' not in st.session_state:
+            st.session_state.account_data = None
+
+        # Botón para cargar portfolio
+        if st.button("🔄 Actualizar Portfolio", type="primary", key="refresh_portfolio"):
+            with st.spinner("📡 Obteniendo portfolio y datos de cuenta..."):
+                portfolio, account, error, debug = fetch_portfolio(
+                    host=host,
+                    port=port,
+                    client_id=client_id + 2
+                )
+
+                st.session_state.debug_log = debug
+
+                if error:
+                    st.error(f"❌ Error: {error}")
+                    with st.expander("🐛 Ver debug log"):
+                        for msg in debug:
+                            st.text(msg)
+                else:
+                    st.session_state.portfolio_data = portfolio
+                    st.session_state.account_data = account
+                    st.session_state.connection_status = True
+                    st.success("✓ Portfolio actualizado")
+
+        # Mostrar datos si existen
+        if st.session_state.account_data:
+            account = st.session_state.account_data
+
+            # =================================================================
+            # RESUMEN GENERAL - Métricas destacadas
+            # =================================================================
+            st.markdown("---")
+            st.subheader("📊 Resumen General")
+
+            # Función helper para obtener valor
+            def get_value(key, default=0):
+                if key in account:
+                    try:
+                        return float(account[key].get('value', default))
+                    except (ValueError, TypeError):
+                        return default
+                return default
+
+            def get_currency(key):
+                if key in account:
+                    return account[key].get('currency', 'USD')
+                return 'USD'
+
+            # Fila 1: Métricas principales
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                net_liq = get_value('NetLiquidation')
+                st.metric(
+                    label="💰 Net Liquidation",
+                    value=f"${net_liq:,.2f}",
+                    help="Valor total de la cuenta"
+                )
+
+            with col2:
+                cash = get_value('TotalCashValue')
+                st.metric(
+                    label="💵 Total Cash",
+                    value=f"${cash:,.2f}",
+                    help="Efectivo disponible"
+                )
+
+            with col3:
+                stock_value = get_value('GrossPositionValue')
+                if stock_value == 0:
+                    stock_value = get_value('StockMarketValue')
+                st.metric(
+                    label="📈 Stock Market Value",
+                    value=f"${stock_value:,.2f}",
+                    help="Valor en acciones"
+                )
+
+            # Fila 2: Más métricas
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                buying_power = get_value('BuyingPower')
+                st.metric(
+                    label="🛒 Buying Power",
+                    value=f"${buying_power:,.2f}",
+                    help="Poder de compra"
+                )
+
+            with col2:
+                unrealized = get_value('UnrealizedPnL')
+                delta_color = "normal" if unrealized >= 0 else "inverse"
+                st.metric(
+                    label="📊 Unrealized P&L",
+                    value=f"${unrealized:,.2f}",
+                    delta=f"{'↑' if unrealized >= 0 else '↓'} {'Ganancia' if unrealized >= 0 else 'Pérdida'}",
+                    delta_color=delta_color,
+                    help="Ganancias/pérdidas no realizadas"
+                )
+
+            with col3:
+                realized = get_value('RealizedPnL')
+                delta_color = "normal" if realized >= 0 else "inverse"
+                st.metric(
+                    label="✅ Realized P&L",
+                    value=f"${realized:,.2f}",
+                    delta=f"{'↑' if realized >= 0 else '↓'} {'Ganancia' if realized >= 0 else 'Pérdida'}",
+                    delta_color=delta_color,
+                    help="Ganancias/pérdidas realizadas"
+                )
+
+            # Fila 3: Márgenes
+            st.markdown("---")
+            st.subheader("📋 Márgenes y Liquidez")
+
+            col1, col2, col3, col4 = st.columns(4)
+
+            with col1:
+                avail_funds = get_value('AvailableFunds')
+                st.metric(
+                    label="✅ Available Funds",
+                    value=f"${avail_funds:,.2f}"
+                )
+
+            with col2:
+                excess_liq = get_value('ExcessLiquidity')
+                st.metric(
+                    label="💧 Excess Liquidity",
+                    value=f"${excess_liq:,.2f}"
+                )
+
+            with col3:
+                init_margin = get_value('InitMarginReq')
+                st.metric(
+                    label="📌 Init Margin Req",
+                    value=f"${init_margin:,.2f}"
+                )
+
+            with col4:
+                maint_margin = get_value('MaintMarginReq')
+                st.metric(
+                    label="🔒 Maint Margin Req",
+                    value=f"${maint_margin:,.2f}"
+                )
+
+            # Cushion (indicador de salud de la cuenta)
+            cushion = get_value('Cushion')
+            if cushion > 0:
+                st.markdown("---")
+                cushion_pct = cushion * 100
+                color = "green" if cushion_pct > 25 else "orange" if cushion_pct > 10 else "red"
+                st.markdown(f"**🛡️ Cushion (Margin Safety):** :{color}[{cushion_pct:.1f}%]")
+                st.progress(min(cushion, 1.0))
+
+            # =================================================================
+            # POSICIONES DEL PORTFOLIO
+            # =================================================================
+            if st.session_state.portfolio_data:
+                st.markdown("---")
+                st.subheader("📦 Posiciones Actuales")
+
+                portfolio_df = pd.DataFrame(st.session_state.portfolio_data)
+
+                if not portfolio_df.empty:
+                    # Calcular P&L total
+                    total_unrealized = portfolio_df['unrealizedPNL'].sum()
+                    total_realized = portfolio_df['realizedPNL'].sum()
+                    total_market_value = portfolio_df['marketValue'].sum()
+
+                    # Métricas de portfolio
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("📊 Posiciones", len(portfolio_df))
+                    with col2:
+                        st.metric("💰 Valor Total", f"${total_market_value:,.2f}")
+                    with col3:
+                        color = "normal" if total_unrealized >= 0 else "inverse"
+                        st.metric(
+                            "📈 P&L Total",
+                            f"${total_unrealized:,.2f}",
+                            delta_color=color
+                        )
+
+                    # Tabla de posiciones
+                    st.markdown("---")
+
+                    # Formatear DataFrame para mostrar
+                    display_portfolio = portfolio_df[[
+                        'symbol', 'position', 'marketPrice', 'marketValue',
+                        'averageCost', 'unrealizedPNL', 'realizedPNL'
+                    ]].copy()
+
+                    display_portfolio.columns = [
+                        'Símbolo', 'Posición', 'Precio', 'Valor Mercado',
+                        'Costo Promedio', 'P&L No Realizado', 'P&L Realizado'
+                    ]
+
+                    # Calcular % P&L
+                    display_portfolio['% P&L'] = (
+                        (display_portfolio['Precio'] - display_portfolio['Costo Promedio'])
+                        / display_portfolio['Costo Promedio'] * 100
+                    ).round(2)
+
+                    st.dataframe(
+                        display_portfolio,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Símbolo": st.column_config.TextColumn("Símbolo"),
+                            "Posición": st.column_config.NumberColumn("Posición", format="%d"),
+                            "Precio": st.column_config.NumberColumn("Precio", format="$%.2f"),
+                            "Valor Mercado": st.column_config.NumberColumn("Valor", format="$%.2f"),
+                            "Costo Promedio": st.column_config.NumberColumn("Costo Prom.", format="$%.2f"),
+                            "P&L No Realizado": st.column_config.NumberColumn("P&L NR", format="$%.2f"),
+                            "P&L Realizado": st.column_config.NumberColumn("P&L R", format="$%.2f"),
+                            "% P&L": st.column_config.NumberColumn("% P&L", format="%.2f%%")
+                        }
+                    )
+
+                    # Gráfico de composición del portfolio
+                    if len(portfolio_df) > 1:
+                        st.markdown("---")
+                        st.subheader("🥧 Composición del Portfolio")
+
+                        fig = go.Figure(data=[go.Pie(
+                            labels=portfolio_df['symbol'],
+                            values=portfolio_df['marketValue'].abs(),
+                            hole=0.4,
+                            textinfo='label+percent',
+                            marker=dict(colors=['#00c853', '#2196f3', '#ff9800', '#9c27b0', '#f44336'])
+                        )])
+                        fig.update_layout(
+                            template='plotly_dark',
+                            height=400,
+                            paper_bgcolor='rgba(0,0,0,0)',
+                            plot_bgcolor='rgba(0,0,0,0)'
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("📭 No hay posiciones abiertas en el portfolio")
+            else:
+                st.info("📭 No hay posiciones en el portfolio")
+
+            # =================================================================
+            # TODOS LOS VALORES DE CUENTA (expandible)
+            # =================================================================
+            with st.expander("📋 Ver todos los valores de cuenta"):
+                account_df = pd.DataFrame([
+                    {
+                        'Campo': key,
+                        'Valor': data.get('value', 'N/A'),
+                        'Moneda': data.get('currency', 'N/A')
+                    }
+                    for key, data in sorted(account.items())
+                ])
+                st.dataframe(account_df, use_container_width=True, hide_index=True)
+
+        else:
+            st.info("👆 Haz clic en 'Actualizar Portfolio' para cargar los datos de tu cuenta")
+
+    # =========================================================================
+    # TAB 3: Test Conexión
+    # =========================================================================
+    with tab3:
         st.subheader("🔧 Test de Conexión con IB")
         st.caption("Usa la misma lógica que test_ibapi.py")
 
@@ -711,9 +1110,9 @@ def main():
             })
 
     # =========================================================================
-    # TAB 3: Debug
+    # TAB 4: Debug
     # =========================================================================
-    with tab3:
+    with tab4:
         st.subheader("🐛 Debug Log")
 
         if st.session_state.debug_log:
