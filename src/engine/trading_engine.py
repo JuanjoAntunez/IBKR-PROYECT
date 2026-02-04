@@ -1,21 +1,25 @@
 """
-Trading Engine - Single Writer Pattern
-======================================
+Trading Engine - Single Writer Pattern (ib_insync)
+==================================================
 Maintains a single persistent connection to IB and processes
-commands from a thread-safe queue.
+commands from a thread-safe queue using ib_insync.
 """
 
-import threading
 import queue
+import threading
+import asyncio
 import time
-from typing import Optional, Callable, List
+import os
 from datetime import datetime
-import pandas as pd
+from typing import Optional, Dict
 
-from ibapi.client import EClient
-from ibapi.wrapper import EWrapper
-from ibapi.contract import Contract
-from ibapi.order import Order as IBOrder
+# Ensure an event loop exists in the importing thread (required by ib_insync/eventkit)
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
+from ib_insync import IB, Stock, Order, LimitOrder, MarketOrder, StopOrder, util, Trade
 
 from .commands import (
     Command,
@@ -28,200 +32,32 @@ from .commands import (
     GetAccountCommand,
     GetPositionsCommand,
     GetOrdersCommand,
+    GetGuardrailsStatusCommand,
+    ActivateKillSwitchCommand,
+    GetMarketSubscriptionsCommand,
     PlaceOrderCommand,
     CancelOrderCommand,
-    OrderAction,
+    SubscribeMarketDataCommand,
+    UnsubscribeMarketDataCommand,
     OrderType,
 )
 from .state import (
     EngineState,
     ConnectionStatus,
     Position,
-    Order,
     OrderStatus,
     AccountSummary,
 )
-
-
-class IBWrapper(EWrapper):
-    """IB API Wrapper that updates EngineState."""
-
-    def __init__(self, state: EngineState, engine: 'TradingEngine'):
-        EWrapper.__init__(self)
-        self.state = state
-        self.engine = engine
-
-        # Temporary storage for async responses
-        self._historical_data_buffer: List[dict] = []
-        self._data_end_event = threading.Event()
-        self._account_end_event = threading.Event()
-        self._positions_end_event = threading.Event()
-
-    def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=""):
-        """Handle errors from IB."""
-        if errorCode in [2104, 2106, 2158]:  # Info messages
-            self.state.add_message(f"Info: {errorString}")
-        elif errorCode == 162:  # No data
-            self.state.add_message(f"No data: {errorString}")
-            self._data_end_event.set()
-        elif errorCode >= 2000:  # Warnings
-            self.state.add_message(f"Warning [{errorCode}]: {errorString}")
-        else:
-            self.state.add_message(f"Error [{errorCode}]: {errorString}")
-
-    def connectAck(self):
-        """Connection acknowledged."""
-        self.state.add_message("Connection acknowledged")
-
-    def connectionClosed(self):
-        """Connection closed."""
-        self.state.set_disconnected()
-
-    def managedAccounts(self, accountsList):
-        """Received list of managed accounts."""
-        accounts = [a.strip() for a in accountsList.split(',') if a.strip()]
-        self.state.add_message(f"Managed accounts: {accounts}")
-        # Store temporarily for connection completion
-        self.engine._temp_accounts = accounts
-
-    def nextValidId(self, orderId):
-        """Next valid order ID."""
-        self.state.set_next_order_id(orderId)
-        self.state.add_message(f"Next valid order ID: {orderId}")
-
-    # =========================================================================
-    # Account Updates
-    # =========================================================================
-
-    def accountSummary(self, reqId, account, tag, value, currency):
-        """Receive account summary values."""
-        try:
-            val = float(value)
-        except (ValueError, TypeError):
-            val = 0.0
-
-        tag_mapping = {
-            "NetLiquidation": "net_liquidation",
-            "TotalCashValue": "total_cash",
-            "BuyingPower": "buying_power",
-            "AvailableFunds": "available_funds",
-            "ExcessLiquidity": "excess_liquidity",
-            "InitMarginReq": "init_margin_req",
-            "MaintMarginReq": "maint_margin_req",
-            "UnrealizedPnL": "unrealized_pnl",
-            "RealizedPnL": "realized_pnl",
-            "Cushion": "cushion",
-        }
-
-        if tag in tag_mapping:
-            self.state.update_account_summary(
-                account_id=account,
-                currency=currency,
-                **{tag_mapping[tag]: val}
-            )
-
-    def accountSummaryEnd(self, reqId):
-        """Account summary complete."""
-        self.state.add_message("Account summary received")
-        self._account_end_event.set()
-
-    # =========================================================================
-    # Portfolio Updates
-    # =========================================================================
-
-    def updatePortfolio(self, contract, position, marketPrice, marketValue,
-                        averageCost, unrealizedPNL, realizedPNL, accountName):
-        """Receive portfolio position updates."""
-        if position != 0:  # Only track non-zero positions
-            pos = Position(
-                symbol=contract.symbol,
-                quantity=int(position),
-                avg_cost=averageCost,
-                market_price=marketPrice,
-                market_value=marketValue,
-                unrealized_pnl=unrealizedPNL,
-                realized_pnl=realizedPNL,
-                account=accountName,
-                currency=contract.currency,
-                sec_type=contract.secType,
-                exchange=contract.exchange,
-            )
-            self.state.update_position(pos)
-        else:
-            self.state.remove_position(contract.symbol)
-
-    def accountDownloadEnd(self, accountName):
-        """Account/portfolio download complete."""
-        self.state.add_message(f"Portfolio download complete for {accountName}")
-        self._positions_end_event.set()
-
-    # =========================================================================
-    # Historical Data
-    # =========================================================================
-
-    def historicalData(self, reqId, bar):
-        """Receive historical data bar."""
-        self._historical_data_buffer.append({
-            'Date': bar.date,
-            'Open': bar.open,
-            'High': bar.high,
-            'Low': bar.low,
-            'Close': bar.close,
-            'Volume': bar.volume,
-        })
-
-    def historicalDataEnd(self, reqId, start, end):
-        """Historical data complete."""
-        self.state.add_message(f"Historical data received: {len(self._historical_data_buffer)} bars")
-        self._data_end_event.set()
-
-    # =========================================================================
-    # Order Updates
-    # =========================================================================
-
-    def orderStatus(self, orderId, status, filled, remaining, avgFillPrice,
-                    permId, parentId, lastFillPrice, clientId, whyHeld, mktCapPrice):
-        """Receive order status update."""
-        status_mapping = {
-            "PendingSubmit": OrderStatus.PENDING,
-            "PendingCancel": OrderStatus.PENDING,
-            "PreSubmitted": OrderStatus.PENDING,
-            "Submitted": OrderStatus.SUBMITTED,
-            "Filled": OrderStatus.FILLED,
-            "Cancelled": OrderStatus.CANCELLED,
-            "Inactive": OrderStatus.ERROR,
-        }
-
-        order_status = status_mapping.get(status, OrderStatus.PENDING)
-
-        self.state.update_order(
-            orderId,
-            status=order_status,
-            filled_quantity=int(filled),
-            avg_fill_price=avgFillPrice,
-        )
-
-    def openOrder(self, orderId, contract, order, orderState):
-        """Receive open order info."""
-        self.state.add_message(f"Open order: {orderId} {order.action} {order.totalQuantity} {contract.symbol}")
-
-    def execDetails(self, reqId, contract, execution):
-        """Receive execution details."""
-        self.state.add_message(
-            f"Execution: {execution.orderId} {execution.side} {execution.shares} {contract.symbol} @ {execution.price}"
-        )
-
-    def commissionReport(self, commissionReport):
-        """Receive commission report."""
-        self.state.update_order(
-            commissionReport.execId,
-            commission=commissionReport.commission,
-        )
+from .guardrails import Guardrails, OrderRequest, TradingLimits
+from .trading_mode import TradingMode, get_mode_manager
+from .audit_log import get_audit_log
+from .order_manager import OrderManager
+from .market_data import MarketDataService
 
 
 class TradingEngine:
     """
-    Single Writer Trading Engine.
+    Single Writer Trading Engine (ib_insync).
 
     Maintains a single persistent connection to IB and processes
     all commands through a dedicated thread.
@@ -230,10 +66,8 @@ class TradingEngine:
     def __init__(self):
         self.state = EngineState()
 
-        # IB API client
-        self._wrapper: Optional[IBWrapper] = None
-        self._client: Optional[EClient] = None
-        self._api_thread: Optional[threading.Thread] = None
+        # IB client (ib_insync)
+        self._ib: Optional[IB] = None
 
         # Command processing
         self._command_queue: queue.PriorityQueue = queue.PriorityQueue()
@@ -241,19 +75,26 @@ class TradingEngine:
         self._running = False
         self._stop_event = threading.Event()
 
-        # Temporary storage
-        self._temp_accounts: List[str] = []
+        # Safety systems
+        self._mode_manager = get_mode_manager()
+        self._guardrails: Optional[Guardrails] = None
+        self._audit_log = get_audit_log()
 
-        # Request ID counter
-        self._next_req_id = 1
-        self._req_id_lock = threading.Lock()
+        # Order tracking
+        self._order_requests: Dict[int, OrderRequest] = {}
+        self._market_data = MarketDataService(self.state)
+        self._order_manager = OrderManager(self.state)
 
-    def _get_req_id(self) -> int:
-        """Get next request ID (thread-safe)."""
-        with self._req_id_lock:
-            req_id = self._next_req_id
-            self._next_req_id += 1
-            return req_id
+        # Reconciliation + resilience
+        self._reconcile_interval = int(os.getenv("IB_RECONCILE_INTERVAL", "10"))
+        self._heartbeat_interval = int(os.getenv("IB_HEARTBEAT_INTERVAL", "10"))
+        self._last_reconcile_time = 0.0
+        self._last_heartbeat_time = 0.0
+        self._auto_reconnect_config = os.getenv("IB_AUTO_RECONNECT", "1") != "0"
+        self._auto_reconnect = self._auto_reconnect_config
+        self._reconnect_attempts = 0
+        self._next_reconnect_time: Optional[float] = None
+        self._last_connect_params: Optional[dict] = None
 
     # =========================================================================
     # Public API (Thread-Safe)
@@ -272,7 +113,7 @@ class TradingEngine:
         self._engine_thread = threading.Thread(
             target=self._engine_loop,
             name="TradingEngine",
-            daemon=True
+            daemon=True,
         )
         self._engine_thread.start()
 
@@ -290,8 +131,8 @@ class TradingEngine:
         self._stop_event.set()
 
         # Disconnect if connected
-        if self._client and self._client.isConnected():
-            self._client.disconnect()
+        if self._ib and self._ib.isConnected():
+            self._ib.disconnect()
 
         # Wait for engine thread
         if self._engine_thread and self._engine_thread.is_alive():
@@ -309,12 +150,11 @@ class TradingEngine:
             command.status = CommandStatus.FAILED
             command.result = CommandResult(
                 success=False,
-                error="Engine not running"
+                error="Engine not running",
             )
             return command.command_id
 
         # Add to priority queue (lower priority number = higher priority)
-        # Using negative priority so higher priority values come first
         self._command_queue.put((-command.priority, command.created_at, command))
         self.state.add_message(f"Command queued: {command}")
 
@@ -322,11 +162,34 @@ class TradingEngine:
 
     def get_status(self) -> dict:
         """Get current engine status snapshot."""
+        def _ts(value: Optional[float]) -> Optional[str]:
+            if not value:
+                return None
+            try:
+                return datetime.fromtimestamp(value).isoformat()
+            except Exception:
+                return None
+
+        next_reconnect = _ts(self._next_reconnect_time) if self._next_reconnect_time else None
         return {
             "running": self._running,
             "connected": self.state.is_connected,
+            "ib_connected": self._ib.isConnected() if self._ib else False,
             "state": self.state.get_snapshot(),
             "queue_size": self._command_queue.qsize(),
+            "heartbeat": {
+                "interval_sec": self._heartbeat_interval,
+                "last": _ts(self._last_heartbeat_time),
+            },
+            "reconcile": {
+                "interval_sec": self._reconcile_interval,
+                "last": _ts(self._last_reconcile_time),
+            },
+            "reconnect": {
+                "auto": self._auto_reconnect,
+                "attempts": self._reconnect_attempts,
+                "next_attempt": next_reconnect,
+            },
         }
 
     def get_positions(self) -> dict:
@@ -360,6 +223,10 @@ class TradingEngine:
     def _engine_loop(self):
         """Main engine loop - processes commands from queue."""
         self.state.add_message("Engine loop started")
+        try:
+            asyncio.get_event_loop()
+        except RuntimeError:
+            asyncio.set_event_loop(asyncio.new_event_loop())
 
         while self._running:
             try:
@@ -367,16 +234,40 @@ class TradingEngine:
                 try:
                     _, _, command = self._command_queue.get(timeout=0.1)
                 except queue.Empty:
-                    continue
+                    command = None
 
                 # Process command
-                self._process_command(command)
-                self._command_queue.task_done()
+                if command is not None:
+                    self._process_command(command)
+                    self._command_queue.task_done()
 
             except Exception as e:
                 self.state.add_message(f"Engine loop error: {e}")
 
+            # Periodic tasks (reconcile, heartbeat, reconnect)
+            self._tick()
+
         self.state.add_message("Engine loop stopped")
+
+    def _tick(self):
+        """Periodic engine maintenance tasks."""
+        now = time.time()
+
+        # Heartbeat + reconcile when connected
+        if self.state.is_connected and self._ib and self._ib.isConnected():
+            if now - self._last_heartbeat_time >= self._heartbeat_interval:
+                self._last_heartbeat_time = now
+                try:
+                    self._ib.reqCurrentTime()
+                except Exception:
+                    self._handle_disconnect("Heartbeat failed")
+            if now - self._last_reconcile_time >= self._reconcile_interval:
+                self._last_reconcile_time = now
+                self._reconcile_state()
+
+        # Reconnect if needed
+        if not self.state.is_connected and self._auto_reconnect:
+            self._maybe_reconnect(now)
 
     def _process_command(self, command: Command):
         """Process a single command."""
@@ -405,20 +296,98 @@ class TradingEngine:
 
         if cmd_type == CommandType.CONNECT:
             return self._execute_connect(command)
-        elif cmd_type == CommandType.DISCONNECT:
+        if cmd_type == CommandType.DISCONNECT:
             return self._execute_disconnect(command)
-        elif cmd_type == CommandType.FETCH_HISTORICAL_DATA:
+        if cmd_type == CommandType.FETCH_HISTORICAL_DATA:
             return self._execute_fetch_historical(command)
-        elif cmd_type == CommandType.GET_ACCOUNT:
+        if cmd_type == CommandType.GET_ACCOUNT:
             return self._execute_get_account(command)
-        elif cmd_type == CommandType.GET_POSITIONS:
+        if cmd_type == CommandType.GET_POSITIONS:
             return self._execute_get_positions(command)
-        elif cmd_type == CommandType.PLACE_ORDER:
+        if cmd_type == CommandType.GET_ORDERS:
+            return self._execute_get_orders(command)
+        if cmd_type == CommandType.GET_GUARDRAILS_STATUS:
+            return self._execute_get_guardrails_status(command)
+        if cmd_type == CommandType.ACTIVATE_KILL_SWITCH:
+            return self._execute_activate_kill_switch(command)
+        if cmd_type == CommandType.GET_MARKET_SUBSCRIPTIONS:
+            return self._execute_get_market_subscriptions(command)
+        if cmd_type == CommandType.SUBSCRIBE_MARKET_DATA:
+            return self._execute_subscribe_market_data(command)
+        if cmd_type == CommandType.UNSUBSCRIBE_MARKET_DATA:
+            return self._execute_unsubscribe_market_data(command)
+        if cmd_type == CommandType.PLACE_ORDER:
             return self._execute_place_order(command)
-        elif cmd_type == CommandType.CANCEL_ORDER:
+        if cmd_type == CommandType.CANCEL_ORDER:
             return self._execute_cancel_order(command)
+        return CommandResult(success=False, error=f"Unknown command type: {cmd_type}")
+
+    # =========================================================================
+    # IB Event Handlers
+    # =========================================================================
+
+    def _setup_ib_handlers(self):
+        if not self._ib:
+            return
+        self._ib.orderStatusEvent += self._on_order_status
+        self._ib.execDetailsEvent += self._on_execution
+        self._ib.errorEvent += self._on_error
+        self._ib.disconnectedEvent += self._on_disconnected
+        self._ib.timeoutEvent += self._on_timeout
+
+    def _on_order_status(self, trade: Trade):
+        """Handle order status updates."""
+        order_id = trade.order.orderId
+        self._order_manager.handle_order_status(trade)
+
+        updated = self.state.get_order(order_id)
+        if updated and updated.status == OrderStatus.FILLED:
+            order_request = self._order_requests.get(order_id)
+            if order_request and self._guardrails:
+                self._guardrails.record_order_executed(order_request)
+            self._audit_log.log_order_executed(
+                mode=self.state.get_connection_info().get("mode", "paper"),
+                order_id=order_id,
+                symbol=trade.contract.symbol,
+                action=trade.order.action,
+                quantity=int(trade.orderStatus.filled),
+                fill_price=trade.orderStatus.avgFillPrice,
+                guardrails_state=self._guardrails.get_status() if self._guardrails else None,
+            )
+        if updated and updated.status == OrderStatus.REJECTED:
+            self._audit_log.log_order_rejected(
+                mode=self.state.get_connection_info().get("mode", "paper"),
+                symbol=trade.contract.symbol,
+                action=trade.order.action,
+                quantity=int(trade.order.totalQuantity),
+                reason=trade.orderStatus.status,
+                violations=[],
+                guardrails_state=self._guardrails.get_status() if self._guardrails else None,
+            )
+
+    def _on_execution(self, trade: Trade, fill):
+        """Handle execution details (logging only)."""
+        self.state.add_message(
+            f"Execution: {trade.order.orderId} {fill.execution.side} "
+            f"{fill.execution.shares} {trade.contract.symbol} @ {fill.execution.price}"
+        )
+
+    def _on_error(self, reqId, errorCode, errorString, contract):
+        """Handle IB errors."""
+        if errorCode in [2104, 2106, 2158]:
+            self.state.add_message(f"Info: {errorString}")
+        elif errorCode >= 2000:
+            self.state.add_message(f"Warning [{errorCode}]: {errorString}")
         else:
-            return CommandResult(success=False, error=f"Unknown command type: {cmd_type}")
+            self.state.add_message(f"Error [{errorCode}]: {errorString}")
+
+    def _on_disconnected(self):
+        """Handle IB disconnection event."""
+        self._handle_disconnect("IB disconnected")
+
+    def _on_timeout(self, idle_seconds: float):
+        """Handle IB timeout event (no data received)."""
+        self._handle_disconnect(f"IB timeout after {idle_seconds:.1f}s idle")
 
     # =========================================================================
     # Command Executors
@@ -430,56 +399,98 @@ class TradingEngine:
             return CommandResult(success=True, data="Already connected")
 
         try:
+            # Mode-specific connection overrides (paper/live separation)
+            mode_key = "LIVE" if cmd.mode.lower() == "live" else "PAPER"
+            host = os.getenv(f"IB_{mode_key}_HOST", cmd.host)
+            port = int(os.getenv(f"IB_{mode_key}_PORT", cmd.port))
+            client_id = int(os.getenv(f"IB_{mode_key}_CLIENT_ID", cmd.client_id))
+
+            requested_mode = TradingMode.LIVE if cmd.mode.lower() == "live" else TradingMode.PAPER
+            validation = self._mode_manager.validate_mode(requested_mode)
+
+            if requested_mode == TradingMode.LIVE:
+                if not validation.valid:
+                    return CommandResult(success=False, error="Live mode validation failed")
+                if not self._mode_manager.require_double_confirmation(auto_confirm=cmd.confirm_live):
+                    return CommandResult(success=False, error="Live mode confirmation required")
+
             self.state.set_connection_status(ConnectionStatus.CONNECTING)
 
-            # Create wrapper and client
-            self._wrapper = IBWrapper(self.state, self)
-            self._client = EClient(self._wrapper)
+            self._ib = IB()
+            self._ib.connect(host, port, clientId=client_id, readonly=False)
+            self._market_data.set_ib(self._ib)
 
-            # Connect
-            self._client.connect(cmd.host, cmd.port, cmd.client_id)
-
-            # Start API thread
-            self._api_thread = threading.Thread(
-                target=self._client.run,
-                name="IBApiThread",
-                daemon=True
-            )
-            self._api_thread.start()
-
-            # Wait for connection
-            start_time = time.time()
-            while not self._client.isConnected() and (time.time() - start_time) < cmd.timeout:
-                time.sleep(0.1)
-
-            if not self._client.isConnected():
+            if not self._ib.isConnected():
                 self.state.set_connection_status(ConnectionStatus.ERROR)
-                return CommandResult(success=False, error="Connection timeout")
+                return CommandResult(success=False, error="Connection failed")
 
-            # Wait for accounts
-            time.sleep(2)
+            self._setup_ib_handlers()
+            try:
+                self._ib.setTimeout(self._heartbeat_interval * 2)
+            except Exception:
+                pass
 
-            # Update state
+            accounts = self._ib.managedAccounts()
+            platform = "TWS" if cmd.port in [7496, 7497] else "Gateway"
+
             self.state.set_connected(
-                host=cmd.host,
-                port=cmd.port,
+                host=host,
+                port=port,
                 mode=cmd.mode,
-                platform="TWS" if cmd.port in [7496, 7497] else "Gateway",
-                accounts=self._temp_accounts,
+                platform=platform,
+                accounts=accounts,
+            )
+
+            # Initialize guardrails based on mode
+            if requested_mode == TradingMode.LIVE:
+                limits = TradingLimits.live_strict_limits()
+            else:
+                limits = TradingLimits.paper_limits()
+
+            self._guardrails = Guardrails(mode=requested_mode, limits=limits)
+            self._auto_reconnect = self._auto_reconnect_config
+            self._reconnect_attempts = 0
+            self._next_reconnect_time = None
+            self._last_connect_params = {
+                "host": host,
+                "port": port,
+                "client_id": client_id,
+                "mode": cmd.mode,
+                "confirm_live": cmd.confirm_live,
+            }
+
+            # Reconcile open orders on connect
+            try:
+                self._order_manager.reconcile_open_orders(self._ib)
+            except Exception:
+                pass
+
+            self._audit_log.log_connection(
+                mode=cmd.mode,
+                host=host,
+                port=port,
+                success=True,
             )
 
             return CommandResult(
                 success=True,
                 data={
-                    "host": cmd.host,
-                    "port": cmd.port,
+                    "host": host,
+                    "port": port,
                     "mode": cmd.mode,
-                    "accounts": self._temp_accounts,
-                }
+                    "accounts": accounts,
+                },
             )
 
         except Exception as e:
             self.state.set_connection_status(ConnectionStatus.ERROR)
+            self._audit_log.log_connection(
+                mode=cmd.mode,
+                host=host if 'host' in locals() else cmd.host,
+                port=port if 'port' in locals() else cmd.port,
+                success=False,
+                error=str(e),
+            )
             return CommandResult(success=False, error=str(e))
 
     def _execute_disconnect(self, cmd: DisconnectCommand) -> CommandResult:
@@ -488,8 +499,15 @@ class TradingEngine:
             return CommandResult(success=True, data="Already disconnected")
 
         try:
-            if self._client:
-                self._client.disconnect()
+            # User-initiated disconnect disables auto-reconnect
+            self._auto_reconnect = False
+            self._last_connect_params = None
+            self._reconnect_attempts = 0
+            self._next_reconnect_time = None
+            # Cancel market data subscriptions
+            self._market_data.stop_all()
+            if self._ib:
+                self._ib.disconnect()
             self.state.set_disconnected()
             return CommandResult(success=True)
         except Exception as e:
@@ -497,25 +515,13 @@ class TradingEngine:
 
     def _execute_fetch_historical(self, cmd: FetchHistoricalDataCommand) -> CommandResult:
         """Execute fetch historical data command."""
-        if not self.state.is_connected:
+        if not self.state.is_connected or not self._ib:
             return CommandResult(success=False, error="Not connected")
 
         try:
-            # Create contract
-            contract = Contract()
-            contract.symbol = cmd.symbol.upper()
-            contract.secType = "STK"
-            contract.exchange = "SMART"
-            contract.currency = "USD"
+            contract = Stock(cmd.symbol.upper(), "SMART", "USD")
 
-            # Clear buffer and reset event
-            self._wrapper._historical_data_buffer = []
-            self._wrapper._data_end_event.clear()
-
-            # Request data
-            req_id = self._get_req_id()
-            self._client.reqHistoricalData(
-                reqId=req_id,
+            bars = self._ib.reqHistoricalData(
                 contract=contract,
                 endDateTime="",
                 durationStr=cmd.duration,
@@ -524,22 +530,27 @@ class TradingEngine:
                 useRTH=1 if cmd.use_rth else 0,
                 formatDate=1,
                 keepUpToDate=False,
-                chartOptions=[],
             )
 
-            # Wait for data
-            if not self._wrapper._data_end_event.wait(timeout=30):
-                return CommandResult(success=False, error="Timeout waiting for data")
-
-            if not self._wrapper._historical_data_buffer:
+            if not bars:
                 return CommandResult(success=False, error="No data received")
 
-            # Create DataFrame
-            df = pd.DataFrame(self._wrapper._historical_data_buffer)
-            df['Date'] = pd.to_datetime(df['Date'])
-            df = df.sort_values('Date')
+            df = util.df(bars)
+            if df is None or df.empty:
+                return CommandResult(success=False, error="No data received")
 
-            # Cache data
+            # Normalize column names to match dashboard expectations
+            df = df.rename(
+                columns={
+                    "date": "Date",
+                    "open": "Open",
+                    "high": "High",
+                    "low": "Low",
+                    "close": "Close",
+                    "volume": "Volume",
+                }
+            )
+
             self.state.set_historical_data(cmd.symbol, df, cmd.duration, cmd.bar_size)
 
             return CommandResult(success=True, data=df)
@@ -549,123 +560,394 @@ class TradingEngine:
 
     def _execute_get_account(self, cmd: GetAccountCommand) -> CommandResult:
         """Execute get account command."""
-        if not self.state.is_connected:
+        if not self.state.is_connected or not self._ib:
             return CommandResult(success=False, error="Not connected")
 
         try:
-            self._wrapper._account_end_event.clear()
+            values = self._ib.accountValues()
 
-            req_id = self._get_req_id()
-            self._client.reqAccountSummary(req_id, "All", cmd.tags)
+            tag_mapping = {
+                "NetLiquidation": "net_liquidation",
+                "TotalCashValue": "total_cash",
+                "BuyingPower": "buying_power",
+                "AvailableFunds": "available_funds",
+                "ExcessLiquidity": "excess_liquidity",
+                "InitMarginReq": "init_margin_req",
+                "MaintMarginReq": "maint_margin_req",
+                "UnrealizedPnL": "unrealized_pnl",
+                "RealizedPnL": "realized_pnl",
+                "Cushion": "cushion",
+            }
 
-            if not self._wrapper._account_end_event.wait(timeout=10):
-                self._client.cancelAccountSummary(req_id)
-                return CommandResult(success=False, error="Timeout getting account")
+            account_id = ""
+            currency = "USD"
+            for av in values:
+                if av.tag in tag_mapping:
+                    try:
+                        val = float(av.value)
+                    except (ValueError, TypeError):
+                        val = 0.0
+                    self.state.update_account_summary(**{tag_mapping[av.tag]: val})
+                    account_id = av.account or account_id
+                    currency = av.currency or currency
 
-            self._client.cancelAccountSummary(req_id)
+            self.state.update_account_summary(account_id=account_id, currency=currency)
 
-            return CommandResult(
-                success=True,
-                data=self.state.get_account_summary()
-            )
+            summary = self.state.get_account_summary()
+            if self._guardrails:
+                account_value = summary.net_liquidation or summary.total_cash
+                if account_value:
+                    self._guardrails.update_account_value(account_value)
+                daily_pnl = summary.realized_pnl + summary.unrealized_pnl
+                self._guardrails.update_daily_pnl(daily_pnl)
+
+            return CommandResult(success=True, data=summary)
 
         except Exception as e:
             return CommandResult(success=False, error=str(e))
 
     def _execute_get_positions(self, cmd: GetPositionsCommand) -> CommandResult:
         """Execute get positions command."""
-        if not self.state.is_connected:
+        if not self.state.is_connected or not self._ib:
             return CommandResult(success=False, error="Not connected")
 
         try:
-            self._wrapper._positions_end_event.clear()
             self.state.clear_positions()
+            positions = self._ib.positions()
 
-            # Request portfolio updates
-            accounts = self.state.get_connection_info().get("accounts", [])
-            if accounts:
-                self._client.reqAccountUpdates(True, accounts[0])
+            total_exposure = 0.0
+            for pos in positions:
+                contract = pos.contract
+                if pos.position == 0:
+                    continue
+                position = Position(
+                    symbol=contract.symbol,
+                    quantity=int(pos.position),
+                    avg_cost=pos.avgCost,
+                    market_price=getattr(pos, "marketPrice", 0.0),
+                    market_value=getattr(pos, "marketValue", 0.0),
+                    unrealized_pnl=getattr(pos, "unrealizedPNL", 0.0),
+                    realized_pnl=getattr(pos, "realizedPNL", 0.0),
+                    account=pos.account,
+                    currency=contract.currency,
+                    sec_type=contract.secType,
+                    exchange=contract.exchange,
+                )
+                self.state.update_position(position)
+                mv = position.market_value or (position.avg_cost * position.quantity)
+                total_exposure += abs(mv)
 
-                if not self._wrapper._positions_end_event.wait(timeout=10):
-                    self._client.reqAccountUpdates(False, accounts[0])
-                    return CommandResult(success=False, error="Timeout getting positions")
+            if self._guardrails:
+                self._guardrails.update_portfolio_exposure(total_exposure)
 
-                self._client.reqAccountUpdates(False, accounts[0])
-
-            return CommandResult(
-                success=True,
-                data=self.state.get_positions()
-            )
+            return CommandResult(success=True, data=self.state.get_positions())
 
         except Exception as e:
             return CommandResult(success=False, error=str(e))
 
+    def _execute_get_orders(self, cmd: GetOrdersCommand) -> CommandResult:
+        """Execute get orders command (state snapshot)."""
+        if self.state.is_connected and self._ib:
+            try:
+                self._order_manager.reconcile_open_orders(self._ib)
+            except Exception:
+                pass
+        return CommandResult(success=True, data=self.state.get_orders())
+
+    def _execute_get_market_subscriptions(self, cmd: GetMarketSubscriptionsCommand) -> CommandResult:
+        """Get active market data subscriptions."""
+        return CommandResult(success=True, data=self._market_data.get_subscriptions())
+
+    def _execute_get_guardrails_status(self, cmd: GetGuardrailsStatusCommand) -> CommandResult:
+        """Get guardrails status."""
+        if not self._guardrails:
+            return CommandResult(success=False, error="Guardrails not initialized")
+        return CommandResult(success=True, data=self._guardrails.get_status())
+
+    def _execute_activate_kill_switch(self, cmd: ActivateKillSwitchCommand) -> CommandResult:
+        """Activate kill switch manually."""
+        if not self._guardrails:
+            return CommandResult(success=False, error="Guardrails not initialized")
+        self._guardrails.activate_kill_switch_manual(cmd.reason)
+        self._audit_log.log(
+            event_type="kill_switch",
+            mode=self.state.get_connection_info().get("mode", "paper"),
+            success=True,
+            details={"reason": cmd.reason},
+            guardrails_state=self._guardrails.get_status(),
+        )
+        return CommandResult(success=True, data=self._guardrails.get_kill_switch_status())
+
+    def _execute_subscribe_market_data(self, cmd: SubscribeMarketDataCommand) -> CommandResult:
+        """Subscribe to real-time market data for a symbol."""
+        if not self.state.is_connected or not self._ib:
+            return CommandResult(success=False, error="Not connected")
+
+        try:
+            result = self._market_data.subscribe(cmd.symbol)
+            if result.get("status") == "error":
+                return CommandResult(success=False, error=result.get("error"))
+            return CommandResult(success=True, data=result)
+        except Exception as e:
+            return CommandResult(success=False, error=str(e))
+
+    def _execute_unsubscribe_market_data(self, cmd: UnsubscribeMarketDataCommand) -> CommandResult:
+        """Unsubscribe from real-time market data for a symbol."""
+        if not self.state.is_connected or not self._ib:
+            return CommandResult(success=False, error="Not connected")
+
+        try:
+            result = self._market_data.unsubscribe(cmd.symbol)
+            if result.get("status") == "error":
+                return CommandResult(success=False, error=result.get("error"))
+            return CommandResult(success=True, data=result)
+        except Exception as e:
+            return CommandResult(success=False, error=str(e))
+
+    # =========================================================================
+    # Reconciliation + Reconnect
+    # =========================================================================
+
+    def _reconcile_state(self):
+        """Reconcile open orders, positions, and account summary."""
+        if not self._ib or not self._ib.isConnected():
+            return
+        try:
+            self._ib.reqAllOpenOrders()
+        except Exception:
+            pass
+        try:
+            self._order_manager.reconcile_open_orders(self._ib)
+        except Exception:
+            pass
+        try:
+            self._execute_get_positions(GetPositionsCommand())
+        except Exception:
+            pass
+        try:
+            self._execute_get_account(GetAccountCommand())
+        except Exception:
+            pass
+
+    def _handle_disconnect(self, reason: str):
+        """Handle disconnects and schedule reconnection."""
+        self.state.add_message(f"Disconnected: {reason}")
+        if self._ib:
+            try:
+                self._ib.disconnect()
+            except Exception:
+                pass
+        self.state.set_connection_status(ConnectionStatus.ERROR)
+        self.state.set_disconnected()
+        if self._auto_reconnect and self._last_connect_params:
+            self._schedule_reconnect()
+
+    def _schedule_reconnect(self):
+        """Schedule next reconnect attempt with backoff."""
+        base = 2.0
+        max_backoff = 60.0
+        backoff = min(base * (2 ** self._reconnect_attempts), max_backoff)
+        self._next_reconnect_time = time.time() + backoff
+        self._reconnect_attempts += 1
+        self.state.add_message(f"Reconnect scheduled in {int(backoff)}s")
+
+    def _maybe_reconnect(self, now: float):
+        """Attempt reconnect if scheduled."""
+        if not self._last_connect_params:
+            return
+        if self._next_reconnect_time is None or now < self._next_reconnect_time:
+            return
+
+        params = dict(self._last_connect_params)
+        host = params["host"]
+        port = params["port"]
+        client_id = params["client_id"]
+        mode = params.get("mode", "paper")
+        confirm_live = params.get("confirm_live", False)
+
+        try:
+            requested_mode = TradingMode.LIVE if mode == "live" else TradingMode.PAPER
+            if requested_mode == TradingMode.LIVE and not self._mode_manager.is_live:
+                validation = self._mode_manager.validate_mode(requested_mode)
+                if not validation.valid:
+                    self._schedule_reconnect()
+                    return
+                if not self._mode_manager.require_double_confirmation(auto_confirm=confirm_live):
+                    self._schedule_reconnect()
+                    return
+
+            self.state.set_connection_status(ConnectionStatus.CONNECTING)
+            self._ib = IB()
+            self._ib.connect(host, port, clientId=client_id, readonly=False)
+            self._market_data.set_ib(self._ib)
+            if not self._ib.isConnected():
+                self._handle_disconnect("Reconnect failed")
+                return
+
+            self._setup_ib_handlers()
+            try:
+                self._ib.setTimeout(self._heartbeat_interval * 2)
+            except Exception:
+                pass
+
+            accounts = self._ib.managedAccounts()
+            platform = "TWS" if port in [7496, 7497] else "Gateway"
+            self.state.set_connected(
+                host=host,
+                port=port,
+                mode=mode,
+                platform=platform,
+                accounts=accounts,
+            )
+
+            # Resubscribe market data
+            try:
+                self._market_data.resubscribe_all()
+            except Exception:
+                pass
+
+            # Full resync
+            self._reconcile_state()
+
+            self._reconnect_attempts = 0
+            self._next_reconnect_time = None
+            self.state.add_message("Reconnected successfully")
+        except Exception:
+            self._schedule_reconnect()
+
+    def _create_ib_order(self, cmd: PlaceOrderCommand) -> Order:
+        """Create an ib_insync Order from PlaceOrderCommand."""
+        if cmd.order_type == OrderType.MARKET:
+            order = MarketOrder(action=cmd.action.value, totalQuantity=cmd.quantity)
+            order.tif = cmd.time_in_force
+            return order
+        if cmd.order_type == OrderType.LIMIT:
+            order = LimitOrder(action=cmd.action.value, totalQuantity=cmd.quantity, lmtPrice=cmd.limit_price)
+            order.tif = cmd.time_in_force
+            return order
+        if cmd.order_type == OrderType.STOP:
+            order = StopOrder(action=cmd.action.value, totalQuantity=cmd.quantity, stopPrice=cmd.stop_price)
+            order.tif = cmd.time_in_force
+            return order
+        if cmd.order_type == OrderType.STOP_LIMIT:
+            order = Order(
+                action=cmd.action.value,
+                totalQuantity=cmd.quantity,
+                orderType="STP LMT",
+                lmtPrice=cmd.limit_price,
+                auxPrice=cmd.stop_price,
+            )
+            order.tif = cmd.time_in_force
+            return order
+        order = Order(action=cmd.action.value, totalQuantity=cmd.quantity, orderType=cmd.order_type.value)
+        order.tif = cmd.time_in_force
+        return order
+
     def _execute_place_order(self, cmd: PlaceOrderCommand) -> CommandResult:
         """Execute place order command."""
-        if not self.state.is_connected:
+        if not self.state.is_connected or not self._ib:
             return CommandResult(success=False, error="Not connected")
 
         if not cmd.validate():
             return CommandResult(success=False, error="Invalid order parameters")
 
+        existing_order, is_idempotent = self._order_manager.resolve_idempotent(cmd)
+        if is_idempotent:
+            if not existing_order:
+                return CommandResult(success=False, error="Idempotency key already used but order not found")
+            return CommandResult(
+                success=True,
+                data={
+                    "order_id": existing_order.order_id,
+                    "idempotent": True,
+                    "status": existing_order.status.value,
+                },
+            )
+
         try:
-            # Create contract
-            contract = Contract()
-            contract.symbol = cmd.symbol.upper()
-            contract.secType = "STK"
-            contract.exchange = "SMART"
-            contract.currency = "USD"
-
-            # Create order
-            order = IBOrder()
-            order.action = cmd.action.value
-            order.totalQuantity = cmd.quantity
-            order.orderType = cmd.order_type.value
-            order.tif = cmd.time_in_force
-
-            if cmd.limit_price is not None:
-                order.lmtPrice = cmd.limit_price
-            if cmd.stop_price is not None:
-                order.auxPrice = cmd.stop_price
-
-            # Get order ID and place order
-            order_id = self.state.get_next_order_id()
-
-            # Track order in state
-            tracked_order = Order(
-                order_id=order_id,
+            # Guardrails validation
+            order_request = OrderRequest(
                 symbol=cmd.symbol,
                 action=cmd.action.value,
                 quantity=cmd.quantity,
                 order_type=cmd.order_type.value,
                 limit_price=cmd.limit_price,
-                stop_price=cmd.stop_price,
-                status=OrderStatus.PENDING,
+                estimated_value=(cmd.limit_price * cmd.quantity) if cmd.limit_price else None,
             )
-            self.state.add_order(tracked_order)
 
-            # Place order
-            self._client.placeOrder(order_id, contract, order)
+            if self._guardrails:
+                validation = self._guardrails.validate_order(order_request)
+                self._audit_log.log_order_attempt(
+                    mode=self.state.get_connection_info().get("mode", "paper"),
+                    symbol=cmd.symbol,
+                    action=cmd.action.value,
+                    quantity=cmd.quantity,
+                    order_type=cmd.order_type.value,
+                    validation_result=validation.to_dict(),
+                    guardrails_state=self._guardrails.get_status(),
+                )
+                if not validation.approved:
+                    self._audit_log.log_order_rejected(
+                        mode=self.state.get_connection_info().get("mode", "paper"),
+                        symbol=cmd.symbol,
+                        action=cmd.action.value,
+                        quantity=cmd.quantity,
+                        reason=validation.message,
+                        violations=validation.to_dict().get("violations", []),
+                        guardrails_state=self._guardrails.get_status(),
+                    )
+                    return CommandResult(success=False, error=validation.message)
 
-            return CommandResult(
-                success=True,
-                data={"order_id": order_id}
-            )
+            contract = Stock(cmd.symbol.upper(), "SMART", "USD")
+            ib_order = self._create_ib_order(cmd)
+
+            # Allocate order id from nextValidId (ib_insync)
+            order_id = self._order_manager.allocate_order_id(self._ib)
+            ib_order.orderId = order_id
+
+            # Register idempotency key + created state
+            self._order_manager.register_key(order_id, cmd.client_order_key)
+            self._order_manager.add_created_order(cmd, order_id)
+
+            # Submit with controlled retries
+            last_error = None
+            for attempt in range(cmd.max_retries + 1):
+                try:
+                    self._ib.placeOrder(contract, ib_order)
+                    self._order_manager.mark_submitted(order_id)
+                    last_error = None
+                    break
+                except Exception as e:
+                    last_error = e
+                    if attempt >= cmd.max_retries:
+                        break
+                    # brief backoff to avoid hammering IB
+                    time.sleep(0.25 * (attempt + 1))
+
+            if last_error:
+                self._order_manager.mark_rejected(order_id, str(last_error))
+                return CommandResult(success=False, error=str(last_error))
+
+            # Track for guardrails/audit
+            self._order_requests[order_id] = order_request
+
+            return CommandResult(success=True, data={"order_id": order_id, "idempotent": False})
 
         except Exception as e:
             return CommandResult(success=False, error=str(e))
 
     def _execute_cancel_order(self, cmd: CancelOrderCommand) -> CommandResult:
         """Execute cancel order command."""
-        if not self.state.is_connected:
+        if not self.state.is_connected or not self._ib:
             return CommandResult(success=False, error="Not connected")
 
         try:
-            self._client.cancelOrder(cmd.order_id, "")
+            order = self.state.get_order(cmd.order_id)
+            if not order:
+                return CommandResult(success=False, error="Order not found")
+            self._ib.cancelOrder(cmd.order_id)
             self.state.update_order(cmd.order_id, status=OrderStatus.CANCELLED)
-
             return CommandResult(success=True, data={"cancelled_order_id": cmd.order_id})
-
         except Exception as e:
             return CommandResult(success=False, error=str(e))
 

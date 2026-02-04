@@ -28,6 +28,7 @@ class OrderStatus(Enum):
     FILLED = "filled"
     PARTIALLY_FILLED = "partially_filled"
     CANCELLED = "cancelled"
+    REJECTED = "rejected"
     ERROR = "error"
 
 
@@ -65,6 +66,7 @@ class Order:
     order_type: str  # MKT, LMT, STP, etc.
     limit_price: Optional[float] = None
     stop_price: Optional[float] = None
+    client_order_key: Optional[str] = None
     status: OrderStatus = OrderStatus.PENDING
     filled_quantity: int = 0
     avg_fill_price: float = 0.0
@@ -133,6 +135,7 @@ class EngineState:
 
         # Market data cache
         self._historical_data: Dict[str, HistoricalData] = {}  # symbol -> HistoricalData
+        self._market_data: Dict[str, Dict[str, Any]] = {}  # symbol -> latest tick dict
 
         # Debug/logging
         self._messages: List[str] = []
@@ -303,6 +306,26 @@ class EngineState:
             return None
 
     # =========================================================================
+    # Market Data Cache
+    # =========================================================================
+
+    def set_market_data(self, symbol: str, data: Dict[str, Any]):
+        """Store latest market data snapshot for a symbol."""
+        with self._lock:
+            self._market_data[symbol] = deepcopy(data)
+
+    def get_market_data(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Get latest market data for a symbol."""
+        with self._lock:
+            data = self._market_data.get(symbol)
+            return deepcopy(data) if data else None
+
+    def get_all_market_data(self) -> Dict[str, Dict[str, Any]]:
+        """Get latest market data for all symbols."""
+        with self._lock:
+            return deepcopy(self._market_data)
+
+    # =========================================================================
     # Messages/Logging
     # =========================================================================
 
@@ -347,5 +370,6 @@ class EngineState:
                 "positions_count": len(self._positions),
                 "active_orders_count": len([o for o in self._orders.values()
                                            if o.status not in {OrderStatus.FILLED, OrderStatus.CANCELLED}]),
+                "market_data_count": len(self._market_data),
                 "messages_count": len(self._messages),
             }

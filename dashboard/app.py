@@ -5,19 +5,32 @@ Dashboard web interactivo usando Streamlit para visualizar datos de mercado.
 
 Ejecutar con: streamlit run dashboard/app.py
 
-IMPORTANTE: Usa la misma lógica de conexión que test_ibapi.py
+IMPORTANTE: Usa el Trading Engine (single-writer) del proyecto
 """
+
+import sys
+import asyncio
+import time
+from pathlib import Path
+from datetime import datetime
 
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from ibapi.client import EClient
-from ibapi.wrapper import EWrapper
-from ibapi.contract import Contract
-import threading
-import time
-from datetime import datetime
+
+# Ensure project root is on sys.path so `src` imports work when running from dashboard/
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+# Ensure an event loop exists for ib_insync/eventkit when running in Streamlit thread
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
+from src.engine.frontend_adapter import get_adapter
 
 
 # =============================================================================
@@ -171,385 +184,165 @@ def log_mode_change(old_mode, new_mode, platform, port):
     print(f"[{timestamp}] MODE CHANGE: {old_mode} → {new_mode} | Platform: {platform} | Port: {port}")
 
 
-# =============================================================================
-# Clase IBApp - EXACTA de test_ibapi.py + Portfolio
-# =============================================================================
-class IBApp(EWrapper, EClient):
-    """Aplicacion simple de IB API - MISMA que test_ibapi.py + Portfolio."""
-
-    def __init__(self):
-        EClient.__init__(self, self)
-        self.connected = False
-        self.accounts = []
-        self.net_liquidation = None
-        self.account_info = {}
-        self.historical_data = []
-        self.data_end = False
-        self.debug_messages = []
-        # Portfolio
-        self.portfolio_items = []
-        self.portfolio_end = False
-        self.account_values = {}
-        self.account_update_end = False
-
-    def _log(self, msg):
-        """Log interno para debug."""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.debug_messages.append(f"[{timestamp}] {msg}")
-        print(f"[IB] {msg}")  # También a consola
-
-    def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=""):
-        """Manejo de errores - MISMA FIRMA que test_ibapi.py (sin type hints)."""
-        if errorCode in [2104, 2106, 2158]:
-            self._log(f"Info: {errorString}")
-        elif errorCode == 162:
-            self._log(f"Sin datos: {errorString}")
-            self.data_end = True
-        elif errorCode >= 2000:
-            self._log(f"Warning [{errorCode}]: {errorString}")
-        else:
-            self._log(f"Error [{errorCode}]: {errorString}")
-
-    def connectAck(self):
-        """Confirmacion de conexion - MISMA que test_ibapi.py."""
-        self._log("✓ Conexion establecida (connectAck)")
-        self.connected = True
-
-    def managedAccounts(self, accountsList):
-        """Recibe la lista de cuentas - MISMA que test_ibapi.py."""
-        self.accounts = accountsList.split(',')
-        self._log(f"Cuentas disponibles: {self.accounts}")
-
-    def accountSummary(self, reqId, account, tag, value, currency):
-        """Recibe valores de resumen de cuenta."""
-        if tag == "NetLiquidation":
-            self.net_liquidation = f"{value} {currency}"
-        self.account_info[tag] = {"value": value, "currency": currency, "account": account}
-        self._log(f"Account {tag}: {value} {currency}")
-
-    def accountSummaryEnd(self, reqId):
-        """Fin del resumen de cuenta."""
-        self._log("accountSummaryEnd recibido")
-        self.account_update_end = True
-
-    def historicalData(self, reqId, bar):
-        """Recibe datos históricos."""
-        self.historical_data.append({
-            'Date': bar.date,
-            'Open': bar.open,
-            'High': bar.high,
-            'Low': bar.low,
-            'Close': bar.close,
-            'Volume': bar.volume
-        })
-
-    def historicalDataEnd(self, reqId, start, end):
-        """Fin de datos históricos."""
-        self._log(f"historicalDataEnd: {len(self.historical_data)} barras recibidas")
-        self.data_end = True
-
-    # =========================================================================
-    # Portfolio callbacks
-    # =========================================================================
-    def updatePortfolio(self, contract, position, marketPrice, marketValue,
-                        averageCost, unrealizedPNL, realizedPNL, accountName):
-        """Recibe actualizaciones del portfolio."""
-        self.portfolio_items.append({
-            'symbol': contract.symbol,
-            'secType': contract.secType,
-            'exchange': contract.exchange,
-            'currency': contract.currency,
-            'position': position,
-            'marketPrice': marketPrice,
-            'marketValue': marketValue,
-            'averageCost': averageCost,
-            'unrealizedPNL': unrealizedPNL,
-            'realizedPNL': realizedPNL,
-            'account': accountName
-        })
-        self._log(f"Portfolio: {contract.symbol} pos={position} mktVal={marketValue:.2f} unrealPNL={unrealizedPNL:.2f}")
-
-    def updateAccountValue(self, key, val, currency, accountName):
-        """Recibe valores de cuenta (más detallados que accountSummary)."""
-        self.account_values[key] = {
-            'value': val,
-            'currency': currency,
-            'account': accountName
-        }
-
-    def updateAccountTime(self, timeStamp):
-        """Timestamp de la última actualización de cuenta."""
-        self._log(f"Account update time: {timeStamp}")
-
-    def accountDownloadEnd(self, accountName):
-        """Fin de descarga de datos de cuenta."""
-        self._log(f"accountDownloadEnd para {accountName}")
-        self.portfolio_end = True
+def _auto_refresh(interval_seconds: int, key: str):
+    """Auto-refresh helper with fallback."""
+    if interval_seconds <= 0:
+        return
+    refresh_fn = getattr(st, "autorefresh", None)
+    if callable(refresh_fn):
+        refresh_fn(interval=interval_seconds * 1000, key=key)
+        return
+    # Fallback: sleep + rerun (blocks UI briefly)
+    time.sleep(interval_seconds)
+    if hasattr(st, "experimental_rerun"):
+        st.experimental_rerun()
 
 
 # =============================================================================
-# Funciones de conexión - MISMA LÓGICA que test_ibapi.py
+# Conexión via Trading Engine (ib_insync single-writer)
 # =============================================================================
-def connect_to_ib(host, port, client_id, timeout=10, mode="paper"):
+
+def connect_to_ib(host, port, client_id, timeout=10, mode="paper", confirm_live=False):
     """
-    Conecta a IB usando EXACTAMENTE la misma lógica que test_ibapi.py.
+    Conecta al Trading Engine (single-writer). No conecta a IB directamente.
 
     Returns:
-        tuple: (app, error_message, debug_messages)
+        tuple: (success, error_message, connection_info, debug_messages)
     """
-    debug = []
-    mode_str = "PAPER (Simulación)" if mode == "paper" else "LIVE (Dinero Real)"
-    debug.append(f"[{mode_str}] Iniciando conexión a {host}:{port} con client_id={client_id}")
-    print(f"[IB] Conectando en modo {mode_str} a puerto {port}")
-
-    # Crear aplicacion - IGUAL que test_ibapi.py
-    app = IBApp()
-
-    try:
-        debug.append(f"Llamando app.connect({host}, {port}, {client_id})...")
-
-        # Conectar - IGUAL que test_ibapi.py
-        app.connect(host, port, client_id)
-
-        debug.append("Conexión socket iniciada, creando thread...")
-
-        # Iniciar thread de la API - IGUAL que test_ibapi.py
-        api_thread = threading.Thread(target=app.run, daemon=True)
-        api_thread.start()
-
-        debug.append("Thread iniciado, esperando connectAck...")
-
-        # Esperar a que se establezca la conexion - IGUAL que test_ibapi.py
-        start_time = time.time()
-
-        while not app.connected and (time.time() - start_time) < timeout:
-            time.sleep(0.1)
-
-        elapsed = time.time() - start_time
-        debug.append(f"Espera terminada después de {elapsed:.1f}s, connected={app.connected}")
-
-        if not app.connected:
-            debug.append("✗ TIMEOUT: connectAck no recibido")
-            debug.extend(app.debug_messages)
-            return None, "Timeout: No se recibió confirmación de conexión", debug
-
-        debug.append("✓ Conexión confirmada!")
-
-        # Esperar a recibir cuentas - IGUAL que test_ibapi.py
-        time.sleep(2)
-        debug.append(f"Cuentas recibidas: {app.accounts}")
-        debug.extend(app.debug_messages)
-
-        return app, None, debug
-
-    except Exception as e:
-        debug.append(f"✗ EXCEPCIÓN: {type(e).__name__}: {e}")
-        debug.extend(app.debug_messages)
-        return None, str(e), debug
+    adapter = get_adapter()
+    success, error, info = adapter.connect(
+        host=host,
+        port=port,
+        client_id=client_id,
+        mode=mode,
+        timeout=timeout,
+        confirm_live=confirm_live,
+    )
+    debug = adapter.get_messages()
+    return success, error, info, debug
 
 
-def get_account_summary(app, timeout=5):
-    """Solicita resumen de cuenta."""
-    if app.accounts:
-        app.reqAccountSummary(1, "All", "NetLiquidation,TotalCashValue,AvailableFunds")
-        time.sleep(timeout)
-    return app.account_info
+def _build_account_data(summary) -> dict:
+    """Adapt Engine account summary to dashboard schema."""
+    if summary is None:
+        return {}
+
+    return {
+        "NetLiquidation": {"value": summary.net_liquidation, "currency": summary.currency},
+        "TotalCashValue": {"value": summary.total_cash, "currency": summary.currency},
+        "BuyingPower": {"value": summary.buying_power, "currency": summary.currency},
+        "AvailableFunds": {"value": summary.available_funds, "currency": summary.currency},
+        "ExcessLiquidity": {"value": summary.excess_liquidity, "currency": summary.currency},
+        "InitMarginReq": {"value": summary.init_margin_req, "currency": summary.currency},
+        "MaintMarginReq": {"value": summary.maint_margin_req, "currency": summary.currency},
+        "UnrealizedPnL": {"value": summary.unrealized_pnl, "currency": summary.currency},
+        "RealizedPnL": {"value": summary.realized_pnl, "currency": summary.currency},
+    }
 
 
-def fetch_portfolio(host, port, client_id):
+def fetch_portfolio(host, port, client_id, mode="paper", confirm_live=False, timeout=15):
     """
-    Obtiene el portfolio completo y resumen de cuenta.
+    Obtiene el portfolio completo y resumen de cuenta vía Trading Engine.
 
     Returns:
         tuple: (portfolio_data, account_data, error_message, debug_messages)
     """
-    debug = []
-    debug.append(f"Solicitando portfolio de {host}:{port}")
+    adapter = get_adapter()
 
-    # Conectar
-    app, error, conn_debug = connect_to_ib(host, port, client_id)
-    debug.extend(conn_debug)
-
-    if error:
+    success, error, _, debug = connect_to_ib(
+        host=host,
+        port=port,
+        client_id=client_id,
+        mode=mode,
+        confirm_live=confirm_live,
+        timeout=timeout,
+    )
+    if not success:
         return None, None, error, debug
 
-    try:
-        # Limpiar datos anteriores
-        app.portfolio_items = []
-        app.account_values = {}
-        app.account_info = {}
-        app.portfolio_end = False
-        app.account_update_end = False
+    acc_ok, acc_err, summary = adapter.get_account(timeout=timeout)
+    pos_ok, pos_err, positions = adapter.get_positions(timeout=timeout)
 
-        # Solicitar Account Summary con todos los tags importantes
-        account_tags = (
-            "NetLiquidation,TotalCashValue,SettledCash,"
-            "AccruedCash,BuyingPower,EquityWithLoanValue,"
-            "GrossPositionValue,RegTEquity,RegTMargin,"
-            "InitMarginReq,MaintMarginReq,AvailableFunds,"
-            "ExcessLiquidity,Cushion,FullInitMarginReq,"
-            "FullMaintMarginReq,FullAvailableFunds,FullExcessLiquidity,"
-            "LookAheadNextChange,LookAheadInitMarginReq,LookAheadMaintMarginReq,"
-            "LookAheadAvailableFunds,LookAheadExcessLiquidity,"
-            "HighestSeverity,DayTradesRemaining,Leverage,"
-            "RealizedPnL,UnrealizedPnL"
-        )
+    if not acc_ok:
+        return None, None, acc_err, adapter.get_messages()
+    if not pos_ok:
+        return None, None, pos_err, adapter.get_messages()
 
-        debug.append("Solicitando reqAccountSummary...")
-        app.reqAccountSummary(1, "All", account_tags)
+    portfolio_data = []
+    for pos in positions.values():
+        portfolio_data.append({
+            "symbol": pos.symbol,
+            "secType": pos.sec_type,
+            "exchange": pos.exchange,
+            "currency": pos.currency,
+            "position": pos.quantity,
+            "marketPrice": pos.market_price,
+            "marketValue": pos.market_value,
+            "averageCost": pos.avg_cost,
+            "unrealizedPNL": pos.unrealized_pnl,
+            "realizedPNL": pos.realized_pnl,
+            "account": pos.account,
+        })
 
-        # Solicitar portfolio (posiciones)
-        if app.accounts:
-            account = app.accounts[0].strip()
-            debug.append(f"Solicitando reqAccountUpdates para {account}...")
-            app.reqAccountUpdates(True, account)
+    account_data = _build_account_data(summary)
 
-        # Esperar datos
-        timeout = 15
-        start_time = time.time()
-        while not app.portfolio_end and (time.time() - start_time) < timeout:
-            time.sleep(0.1)
-
-        # Dar tiempo extra para account summary
-        time.sleep(2)
-
-        elapsed = time.time() - start_time
-        debug.append(f"Espera terminada después de {elapsed:.1f}s")
-        debug.append(f"Portfolio items: {len(app.portfolio_items)}")
-        debug.append(f"Account values: {len(app.account_values)}")
-        debug.append(f"Account info: {len(app.account_info)}")
-        debug.extend(app.debug_messages)
-
-        # Cancelar suscripciones
-        app.reqAccountUpdates(False, "")
-        app.cancelAccountSummary(1)
-
-        # Preparar datos
-        portfolio_data = app.portfolio_items if app.portfolio_items else []
-
-        # Combinar account_info y account_values
-        account_data = {**app.account_info, **app.account_values}
-
-        return portfolio_data, account_data, None, debug
-
-    except Exception as e:
-        debug.append(f"✗ Error: {e}")
-        return None, None, str(e), debug
-
-    finally:
-        if app and app.isConnected():
-            app.disconnect()
-            debug.append("Desconectado")
+    return portfolio_data, account_data, None, adapter.get_messages()
 
 
-def create_contract(symbol):
-    """Crea un contrato de acciones."""
-    contract = Contract()
-    contract.symbol = symbol.upper()
-    contract.secType = "STK"
-    contract.exchange = "SMART"
-    contract.currency = "USD"
-    return contract
-
-
-def get_duration_string(duration):
-    """Convierte duración legible a formato IB."""
+def _format_duration(duration):
     duration_map = {
         "1D": "1 D",
         "5D": "5 D",
         "1M": "1 M",
         "3M": "3 M",
         "6M": "6 M",
-        "1Y": "1 Y"
+        "1Y": "1 Y",
     }
     return duration_map.get(duration, "1 M")
 
 
-def get_bar_size(interval):
-    """Convierte intervalo legible a formato IB."""
+def _format_bar_size(interval):
     bar_map = {
         "1min": "1 min",
         "5min": "5 mins",
         "15min": "15 mins",
         "1h": "1 hour",
-        "1d": "1 day"
+        "1d": "1 day",
     }
     return bar_map.get(interval, "1 day")
 
 
-def fetch_historical_data(host, port, client_id, symbol, duration, bar_size):
+def fetch_historical_data(host, port, client_id, symbol, duration, bar_size, mode="paper", confirm_live=False, timeout=30):
     """
-    Obtiene datos históricos usando la misma lógica de conexión.
+    Obtiene datos históricos vía Trading Engine.
 
     Returns:
         tuple: (dataframe, error_message, debug_messages)
     """
-    debug = []
-    debug.append(f"Solicitando datos para {symbol}, duración={duration}, barras={bar_size}")
+    adapter = get_adapter()
 
-    # Conectar
-    app, error, conn_debug = connect_to_ib(host, port, client_id)
-    debug.extend(conn_debug)
-
-    if error:
+    success, error, _, debug = connect_to_ib(
+        host=host,
+        port=port,
+        client_id=client_id,
+        mode=mode,
+        confirm_live=confirm_live,
+        timeout=timeout,
+    )
+    if not success:
         return None, error, debug
 
-    try:
-        # Crear contrato
-        contract = create_contract(symbol)
-        debug.append(f"Contrato creado: {symbol} STK SMART USD")
+    ok, err, df = adapter.fetch_historical_data(
+        symbol=symbol,
+        duration=_format_duration(duration),
+        bar_size=_format_bar_size(bar_size),
+        timeout=timeout,
+    )
 
-        # Limpiar datos anteriores
-        app.historical_data = []
-        app.data_end = False
+    if not ok:
+        return None, err, adapter.get_messages()
 
-        # Solicitar datos
-        end_datetime = ""  # Cadena vacía = ahora
-
-        debug.append(f"Solicitando reqHistoricalData...")
-        app.reqHistoricalData(
-            reqId=1,
-            contract=contract,
-            endDateTime=end_datetime,
-            durationStr=get_duration_string(duration),
-            barSizeSetting=get_bar_size(bar_size),
-            whatToShow="TRADES",
-            useRTH=1,
-            formatDate=1,
-            keepUpToDate=False,
-            chartOptions=[]
-        )
-
-        # Esperar datos
-        timeout = 30
-        start_time = time.time()
-        while not app.data_end and (time.time() - start_time) < timeout:
-            time.sleep(0.1)
-
-        elapsed = time.time() - start_time
-        debug.append(f"Espera de datos terminada después de {elapsed:.1f}s")
-        debug.extend(app.debug_messages)
-
-        if not app.historical_data:
-            return None, "No se recibieron datos históricos", debug
-
-        # Crear DataFrame
-        df = pd.DataFrame(app.historical_data)
-        df['Date'] = pd.to_datetime(df['Date'])
-        df = df.sort_values('Date')
-
-        debug.append(f"✓ Datos procesados: {len(df)} barras")
-
-        return df, None, debug
-
-    except Exception as e:
-        debug.append(f"✗ Error: {e}")
-        return None, str(e), debug
-
-    finally:
-        if app and app.isConnected():
-            app.disconnect()
-            debug.append("Desconectado")
+    return df, None, adapter.get_messages()
 
 
 def create_candlestick_chart(df, symbol):
@@ -644,6 +437,18 @@ def main():
         st.session_state.portfolio_data = None
     if 'account_data' not in st.session_state:
         st.session_state.account_data = None
+    if 'market_symbol' not in st.session_state:
+        st.session_state.market_symbol = "AAPL"
+    if 'market_duration' not in st.session_state:
+        st.session_state.market_duration = "1M"
+    if 'market_interval' not in st.session_state:
+        st.session_state.market_interval = "1d"
+    if 'auto_refresh_ticks' not in st.session_state:
+        st.session_state.auto_refresh_ticks = True
+    if 'auto_refresh_interval' not in st.session_state:
+        st.session_state.auto_refresh_interval = 5
+    if 'tick_history' not in st.session_state:
+        st.session_state.tick_history = {}
 
     # =========================================================================
     # SIDEBAR
@@ -761,56 +566,6 @@ def main():
         st.markdown("---")
 
         # =================================================================
-        # DATOS DE MERCADO
-        # =================================================================
-        st.subheader("📈 Datos de Mercado")
-        symbol = st.text_input(
-            "Símbolo",
-            value="AAPL",
-            help="Símbolo de la acción (ej: AAPL, MSFT, GOOGL)"
-        ).upper()
-
-        duration = st.selectbox(
-            "Duración",
-            options=["1D", "5D", "1M", "3M", "6M", "1Y"],
-            index=2,
-            help="Período de tiempo"
-        )
-
-        interval = st.selectbox(
-            "Intervalo",
-            options=["1min", "5min", "15min", "1h", "1d"],
-            index=4,
-            help="Tamaño de cada barra"
-        )
-
-        st.markdown("---")
-
-        # =================================================================
-        # BOTONES DE ACCIÓN
-        # =================================================================
-        # Verificar si puede conectar (Live requiere confirmación)
-        can_connect = st.session_state.trading_mode == "paper" or st.session_state.live_confirmed
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-            connect_btn = st.button(
-                "🔌 Test Conexión",
-                use_container_width=True,
-                type="secondary",
-                disabled=not can_connect
-            )
-
-        with col2:
-            fetch_btn = st.button(
-                "📥 Obtener Datos",
-                use_container_width=True,
-                type="primary",
-                disabled=not can_connect
-            )
-
-        # =================================================================
         # ESTADO DE CONEXIÓN MEJORADO
         # =================================================================
         st.markdown("---")
@@ -852,6 +607,13 @@ def main():
     # =========================================================================
     # ÁREA PRINCIPAL
     # =========================================================================
+    symbol = st.session_state.market_symbol.strip().upper()
+    duration = st.session_state.market_duration
+    interval = st.session_state.market_interval
+
+    # Verificar si puede conectar (Live requiere confirmación)
+    can_connect = st.session_state.trading_mode == "paper" or st.session_state.live_confirmed
+
     st.title(f"📊 Dashboard de Trading - {symbol}")
 
     # Estado de conexión mejorado
@@ -883,6 +645,141 @@ def main():
     # TAB 1: Datos Históricos
     # =========================================================================
     with tab1:
+        st.subheader("📈 Datos de Mercado")
+
+        cols = st.columns([2, 1, 1, 1])
+        with cols[0]:
+            st.text_input(
+                "Símbolo",
+                value=st.session_state.market_symbol,
+                help="Símbolo de la acción (ej: AAPL, MSFT, GOOGL)",
+                key="market_symbol",
+            )
+        with cols[1]:
+            duration_options = ["1D", "5D", "1M", "3M", "6M", "1Y"]
+            duration_index = duration_options.index(st.session_state.market_duration) if st.session_state.market_duration in duration_options else 2
+            st.selectbox(
+                "Duración",
+                options=duration_options,
+                index=duration_index,
+                help="Período de tiempo",
+                key="market_duration",
+            )
+        with cols[2]:
+            interval_options = ["1min", "5min", "15min", "1h", "1d"]
+            interval_index = interval_options.index(st.session_state.market_interval) if st.session_state.market_interval in interval_options else 4
+            st.selectbox(
+                "Intervalo",
+                options=interval_options,
+                index=interval_index,
+                help="Tamaño de cada barra",
+                key="market_interval",
+            )
+        with cols[3]:
+            fetch_btn = st.button(
+                "📥 Obtener Datos",
+                use_container_width=True,
+                type="primary",
+                disabled=not can_connect,
+            )
+
+        st.markdown("---")
+
+        # Suscripciones activas (cache)
+        adapter = get_adapter()
+        subs_ok, subs_err, subs = adapter.get_market_subscriptions(timeout=5)
+        subs = subs or {}
+        if subs_ok and subs:
+            st.caption(f"📡 Suscripciones activas: {', '.join(sorted(subs.keys()))}")
+        elif subs_ok:
+            st.caption("📡 Suscripciones activas: ninguna")
+        else:
+            st.caption(f"📡 Suscripciones activas: error ({subs_err})")
+
+        # Panel de ticks en vivo (cache)
+        market_data = adapter.get_cached_market_data() or {}
+        # Auto-refresh controls
+        controls = st.columns([1, 1, 2])
+        with controls[0]:
+            st.toggle("Auto‑refresh", key="auto_refresh_ticks")
+        with controls[1]:
+            st.slider("Intervalo (s)", min_value=1, max_value=30, key="auto_refresh_interval")
+        with controls[2]:
+            st.caption("Actualiza el panel sin re-solicitar datos a IB")
+
+        if st.session_state.auto_refresh_ticks:
+            _auto_refresh(st.session_state.auto_refresh_interval, key="ticks_autorefresh")
+
+        # Update tick history for sparklines
+        tick_history = st.session_state.tick_history
+        for sym, data in market_data.items():
+            price = data.get("last")
+            if not isinstance(price, (int, float)):
+                price = data.get("mid")
+            if not isinstance(price, (int, float)):
+                price = data.get("close")
+            if not isinstance(price, (int, float)):
+                price = data.get("bid")
+            if not isinstance(price, (int, float)):
+                price = data.get("ask")
+            if isinstance(price, (int, float)):
+                series = tick_history.get(sym, [])
+                series.append({
+                    "ts": data.get("timestamp") or datetime.now().isoformat(),
+                    "price": price,
+                })
+                if len(series) > 60:
+                    series = series[-60:]
+                tick_history[sym] = series
+        st.session_state.tick_history = tick_history
+
+        if market_data:
+            st.subheader("📡 Live Ticks (cache)")
+            for sym in sorted(market_data.keys()):
+                data = market_data.get(sym, {})
+                cols_tick = st.columns([1.5, 1.5, 2, 2, 2, 0.8])
+                last = data.get("last")
+                bid = data.get("bid")
+                ask = data.get("ask")
+                ts = data.get("timestamp", "")
+
+                with cols_tick[0]:
+                    st.markdown(f"**{sym}**")
+                with cols_tick[1]:
+                    st.caption("Last")
+                    st.write(f"{last:.2f}" if isinstance(last, (int, float)) else "—")
+                with cols_tick[2]:
+                    st.caption("Bid / Ask")
+                    bid_txt = f"{bid:.2f}" if isinstance(bid, (int, float)) else "—"
+                    ask_txt = f"{ask:.2f}" if isinstance(ask, (int, float)) else "—"
+                    st.write(f"{bid_txt} / {ask_txt}")
+                with cols_tick[3]:
+                    st.caption("Timestamp")
+                    st.write(ts if ts else "—")
+                with cols_tick[4]:
+                    st.caption("Sparkline")
+                    series = st.session_state.tick_history.get(sym, [])
+                    if series:
+                        df_spark = pd.DataFrame(series)
+                        df_spark["ts"] = pd.to_datetime(df_spark["ts"], errors="coerce")
+                        st.line_chart(
+                            df_spark.set_index("ts")["price"],
+                            height=70,
+                            use_container_width=True,
+                        )
+                    else:
+                        st.write("—")
+                with cols_tick[5]:
+                    if st.button("⛔", key=f"unsub_{sym}", help="Desuscribir"):
+                        ok, err, _ = adapter.unsubscribe_market_data(sym, timeout=5)
+                        if ok:
+                            st.success(f"Desuscrito {sym}")
+                            st.rerun()
+                        else:
+                            st.error(err or "Error al desuscribir")
+        else:
+            st.info("Sin ticks en cache (suscribe un símbolo para ver datos).")
+
         if fetch_btn:
             # Verificar permisos para Live
             if st.session_state.trading_mode == "live" and not st.session_state.live_confirmed:
@@ -895,7 +792,9 @@ def main():
                         client_id=st.session_state.client_id + 1,
                         symbol=symbol,
                         duration=duration,
-                        bar_size=interval
+                        bar_size=interval,
+                        mode=st.session_state.trading_mode,
+                        confirm_live=st.session_state.live_confirmed,
                     )
 
                     st.session_state.debug_log = debug
@@ -917,6 +816,8 @@ def main():
                         st.session_state.last_symbol = symbol
                         st.session_state.connection_status = True
                         st.success(f"✓ {len(df)} barras obtenidas")
+                        # Auto-suscribir market data para este símbolo
+                        adapter.subscribe_market_data(symbol, timeout=5)
                     else:
                         st.warning("⚠️ No se encontraron datos")
 
@@ -967,7 +868,11 @@ def main():
 
             display_df = df.tail(20).copy()
             display_df = display_df.sort_values('Date', ascending=False)
+            # Ensure Date is datetime-like before formatting
+            original_date = display_df['Date'].copy()
+            display_df['Date'] = pd.to_datetime(display_df['Date'], errors='coerce')
             display_df['Date'] = display_df['Date'].dt.strftime('%Y-%m-%d %H:%M')
+            display_df['Date'] = display_df['Date'].fillna(original_date.astype(str))
             display_df = display_df.round(2)
 
             st.dataframe(
@@ -1013,7 +918,9 @@ def main():
                     portfolio, account_info, error, debug = fetch_portfolio(
                         host=st.session_state.host,
                         port=port,
-                        client_id=st.session_state.client_id + 2
+                        client_id=st.session_state.client_id + 2,
+                        mode=st.session_state.trading_mode,
+                        confirm_live=st.session_state.live_confirmed,
                     )
 
                     st.session_state.debug_log = debug
@@ -1276,44 +1183,56 @@ def main():
         st.markdown(f"**Modo actual:** :{mode_color}[{mode_text}]")
         st.markdown(f"**Plataforma:** {st.session_state.platform} | **Puerto:** {port}")
 
+        connect_btn = st.button(
+            "🔌 Test Conexión",
+            use_container_width=True,
+            type="secondary",
+            disabled=not can_connect,
+        )
+
         if connect_btn:
             if st.session_state.trading_mode == "live" and not st.session_state.live_confirmed:
                 st.error("⛔ Debes confirmar el modo Live antes de conectar")
             else:
                 with st.spinner(f"🔄 Conectando a {st.session_state.platform} ({mode_text})..."):
-                    app, error, debug = connect_to_ib(
+                    success, error, info, debug = connect_to_ib(
                         st.session_state.host,
                         port,
                         st.session_state.client_id,
                         timeout=st.session_state.timeout,
-                        mode=st.session_state.trading_mode
+                        mode=st.session_state.trading_mode,
+                        confirm_live=st.session_state.live_confirmed,
                     )
 
                     st.session_state.debug_log = debug
 
-                    if error:
+                    if error or not success:
                         st.session_state.connection_status = False
-                        st.session_state.connection_info = {"error": error, "debug": debug}
+                        st.session_state.connection_info = {"error": error or "Connection failed", "debug": debug}
                     else:
-                        # Solicitar info de cuenta
+                        # Solicitar info de cuenta desde el engine
                         st.write("Solicitando resumen de cuenta...")
-                        account_info = get_account_summary(app)
+                        adapter = get_adapter()
+                        acc_ok, acc_err, summary = adapter.get_account(timeout=st.session_state.timeout)
 
-                        st.session_state.connection_status = True
-                        st.session_state.connection_info = {
-                            "connected": True,
-                            "accounts": app.accounts,
-                            "account_info": account_info,
-                            "net_liquidation": app.net_liquidation,
-                            "debug": debug + app.debug_messages,
-                            "mode": st.session_state.trading_mode,
-                            "platform": st.session_state.platform,
-                            "port": port
-                        }
+                        if not acc_ok:
+                            st.session_state.connection_status = False
+                            st.session_state.connection_info = {"error": acc_err or "Account fetch failed", "debug": debug}
+                        else:
+                            account_info = _build_account_data(summary)
 
-                        # Desconectar
-                        if app.isConnected():
-                            app.disconnect()
+                            st.session_state.connection_status = True
+                            accounts = info.get("accounts", []) if isinstance(info, dict) else []
+                            st.session_state.connection_info = {
+                                "connected": True,
+                                "accounts": accounts,
+                                "account_info": account_info,
+                                "net_liquidation": account_info.get("NetLiquidation", {}).get("value"),
+                                "debug": debug,
+                                "mode": st.session_state.trading_mode,
+                                "platform": st.session_state.platform,
+                                "port": port,
+                            }
 
         # Mostrar resultados
         if st.session_state.connection_info:
@@ -1376,11 +1295,11 @@ def main():
                         st.text(msg)
 
                 st.warning("""
-                **Verifica (igual que test_ibapi.py):**
+                **Verifica:**
 
                 1. ✅ TWS está abierto y logueado
                 2. ✅ Puerto correcto:
-                   - **7496** - TWS Live (default en test_ibapi.py)
+                   - **7496** - TWS Live
                    - **7497** - TWS Paper Trading
                 3. ✅ API habilitada en TWS:
                    - File → Global Configuration → API → Settings
@@ -1537,6 +1456,19 @@ def main():
                 st.rerun()
         else:
             st.info("No hay mensajes de debug. Ejecuta una conexión o solicitud de datos.")
+
+        st.markdown("---")
+        st.subheader("🫀 Engine Health")
+        adapter = get_adapter()
+        engine_status = adapter.get_status()
+        st.json({
+            "running": engine_status.get("running"),
+            "connected": engine_status.get("connected"),
+            "ib_connected": engine_status.get("ib_connected"),
+            "heartbeat": engine_status.get("heartbeat"),
+            "reconcile": engine_status.get("reconcile"),
+            "reconnect": engine_status.get("reconnect"),
+        })
 
         st.markdown("---")
         st.subheader("📋 Estado de Session")

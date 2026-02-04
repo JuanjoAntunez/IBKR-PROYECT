@@ -6,6 +6,7 @@ visualizar datos y monitorear estrategias.
 """
 
 import asyncio
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional, List, Dict, Any
@@ -16,9 +17,22 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from src.utils.logger import logger
-from src.connection.ib_client import IBClient
-from src.data.fetcher import HistoricalDataFetcher
-from src.data.stream import MarketDataStream, TickData
+from src.engine import (
+    get_engine,
+    CommandResult,
+    ConnectCommand,
+    DisconnectCommand,
+    FetchHistoricalDataCommand,
+    GetOrdersCommand,
+    PlaceOrderCommand,
+    CancelOrderCommand,
+    GetGuardrailsStatusCommand,
+    ActivateKillSwitchCommand,
+    OrderAction,
+    OrderType,
+    SubscribeMarketDataCommand,
+    UnsubscribeMarketDataCommand,
+)
 from src.strategies import (
     MovingAverageCrossover,
     StrategyConfig,
@@ -27,9 +41,7 @@ from src.strategies import (
 
 # Estado global de la aplicación
 app_state: Dict[str, Any] = {
-    "ib_client": None,
-    "fetcher": None,
-    "stream": None,
+    "engine": get_engine(),
     "strategies": {},
     "websocket_clients": [],
 }
@@ -42,6 +54,8 @@ class ConnectionRequest(BaseModel):
     host: str = "127.0.0.1"
     port: int = 7497
     client_id: int = 1
+    mode: str = "paper"
+    confirm_live: bool = False
 
 
 class HistoricalDataRequest(BaseModel):
@@ -49,6 +63,11 @@ class HistoricalDataRequest(BaseModel):
     symbol: str
     duration: str = "1 M"
     bar_size: str = "1 day"
+
+
+class MarketDataSubscribeRequest(BaseModel):
+    """Request para suscribir mercado."""
+    symbol: str
 
 
 class StreamRequest(BaseModel):
@@ -66,6 +85,24 @@ class StrategyRequest(BaseModel):
     max_position_size: float = 10000.0
 
 
+class OrderPlaceRequest(BaseModel):
+    """Request para colocar orden."""
+    symbol: str
+    action: str  # BUY/SELL
+    quantity: int
+    order_type: str = "MKT"  # MKT/LMT/STP/STP LMT
+    limit_price: Optional[float] = None
+    stop_price: Optional[float] = None
+    time_in_force: str = "DAY"
+    client_order_key: str
+    max_retries: int = 0
+
+
+class OrderCancelRequest(BaseModel):
+    """Request para cancelar orden."""
+    order_id: int
+
+
 # ==================== Lifecycle ====================
 
 @asynccontextmanager
@@ -75,8 +112,9 @@ async def lifespan(app: FastAPI):
     yield
     # Cleanup
     logger.info("Cerrando aplicación web...")
-    if app_state["ib_client"]:
-        await app_state["ib_client"].disconnect()
+    engine = app_state.get("engine")
+    if engine:
+        engine.stop()
 
 
 def create_app() -> FastAPI:
@@ -99,6 +137,30 @@ def create_app() -> FastAPI:
 def register_routes(app: FastAPI):
     """Registra todas las rutas de la API."""
 
+    def _execute_sync(command, timeout: int = 20) -> CommandResult:
+        engine = app_state["engine"]
+        if not engine:
+            return CommandResult(success=False, error="Engine not initialized")
+
+        # Ensure engine running
+        if not engine._running:
+            engine.start()
+
+        completed = threading.Event()
+        holder = {"result": None}
+
+        def on_complete(result: CommandResult):
+            holder["result"] = result
+            completed.set()
+
+        command.callback = on_complete
+        engine.submit_command(command)
+
+        if completed.wait(timeout=timeout):
+            return holder["result"]
+
+        return CommandResult(success=False, error=f"Command timeout after {timeout}s")
+
     @app.get("/", response_class=HTMLResponse)
     async def home():
         """Página principal del dashboard."""
@@ -109,158 +171,194 @@ def register_routes(app: FastAPI):
     @app.get("/api/status")
     async def get_status():
         """Obtiene el estado de la conexión."""
-        client = app_state.get("ib_client")
-        connected = client.is_connected() if client else False
+        engine = app_state.get("engine")
+        connected = engine.state.is_connected if engine else False
 
         return {
             "connected": connected,
             "timestamp": datetime.now().isoformat(),
-            "active_streams": len(app_state.get("stream", {})._subscriptions) if app_state.get("stream") else 0,
+            "active_streams": engine.state.get_snapshot().get("market_data_count", 0) if engine else 0,
             "active_strategies": len(app_state.get("strategies", {})),
         }
 
     @app.post("/api/connect")
     async def connect(request: ConnectionRequest):
         """Conecta con Interactive Brokers."""
-        try:
-            client = IBClient(
-                host=request.host,
-                port=request.port,
-                client_id=request.client_id,
-            )
-            await client.connect()
+        cmd = ConnectCommand(
+            host=request.host,
+            port=request.port,
+            client_id=request.client_id,
+            mode=request.mode,
+            confirm_live=request.confirm_live,
+        )
+        result = _execute_sync(cmd, timeout=20)
 
-            app_state["ib_client"] = client
-            app_state["fetcher"] = HistoricalDataFetcher(client.ib)
-            app_state["stream"] = MarketDataStream(client.ib)
+        if not result.success:
+            logger.error(f"Error conectando: {result.error}")
+            raise HTTPException(status_code=500, detail=result.error or "Error conectando")
 
-            logger.info("Conexión establecida via web")
-
-            return {
-                "success": True,
-                "message": f"Conectado a IB en {request.host}:{request.port}",
-            }
-
-        except Exception as e:
-            logger.error(f"Error conectando: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+        logger.info("Conexión establecida via web")
+        return {
+            "success": True,
+            "message": f"Conectado a IB en {request.host}:{request.port}",
+        }
 
     @app.post("/api/disconnect")
     async def disconnect():
         """Desconecta de Interactive Brokers."""
-        client = app_state.get("ib_client")
+        cmd = DisconnectCommand()
+        result = _execute_sync(cmd, timeout=10)
 
-        if not client:
-            return {"success": True, "message": "No hay conexión activa"}
+        if not result.success:
+            logger.error(f"Error desconectando: {result.error}")
+            raise HTTPException(status_code=500, detail=result.error or "Error desconectando")
 
-        try:
-            # Cancelar streams
-            stream = app_state.get("stream")
-            if stream:
-                await stream.unsubscribe_all()
-
-            await client.disconnect()
-
-            app_state["ib_client"] = None
-            app_state["fetcher"] = None
-            app_state["stream"] = None
-
-            return {"success": True, "message": "Desconectado de IB"}
-
-        except Exception as e:
-            logger.error(f"Error desconectando: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+        return {"success": True, "message": "Desconectado de IB"}
 
     # ==================== Datos Históricos ====================
 
     @app.post("/api/historical")
     async def get_historical_data(request: HistoricalDataRequest):
         """Obtiene datos históricos de un símbolo."""
-        fetcher = app_state.get("fetcher")
+        cmd = FetchHistoricalDataCommand(
+            symbol=request.symbol,
+            duration=request.duration,
+            bar_size=request.bar_size,
+        )
+        result = _execute_sync(cmd, timeout=30)
 
-        if not fetcher:
-            raise HTTPException(status_code=400, detail="No hay conexión con IB")
+        if not result.success:
+            logger.error(f"Error obteniendo datos históricos: {result.error}")
+            raise HTTPException(status_code=500, detail=result.error or "Error obteniendo datos")
 
-        try:
-            df = await fetcher.get_stock_bars(
-                symbol=request.symbol,
-                duration=request.duration,
-                bar_size=request.bar_size,
-            )
+        df = result.data
+        if df is None or df.empty:
+            return {"symbol": request.symbol, "data": [], "count": 0}
 
-            if df.empty:
-                return {"symbol": request.symbol, "data": [], "count": 0}
+        data = df.to_dict(orient="records")
+        for row in data:
+            if "Date" in row and hasattr(row["Date"], "isoformat"):
+                row["Date"] = row["Date"].isoformat()
 
-            # Convertir a formato JSON-friendly
-            data = df.to_dict(orient="records")
+        return {
+            "symbol": request.symbol,
+            "data": data,
+            "count": len(data),
+        }
 
-            # Convertir fechas
-            for row in data:
-                if "date" in row and hasattr(row["date"], "isoformat"):
-                    row["date"] = row["date"].isoformat()
+    # ==================== Órdenes ====================
 
-            return {
-                "symbol": request.symbol,
-                "data": data,
-                "count": len(data),
-            }
+    @app.post("/api/orders/place")
+    async def place_order(request: OrderPlaceRequest):
+        """Place order via single-writer engine with idempotency."""
+        action = request.action.upper()
+        order_type = request.order_type.upper()
 
-        except Exception as e:
-            logger.error(f"Error obteniendo datos históricos: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+        if action not in {"BUY", "SELL"}:
+            raise HTTPException(status_code=400, detail="Invalid action")
+        if order_type not in {"MKT", "LMT", "STP", "STP LMT"}:
+            raise HTTPException(status_code=400, detail="Invalid order_type")
+        if order_type == "LMT" and request.limit_price is None:
+            raise HTTPException(status_code=400, detail="limit_price required for LMT")
+        if order_type == "STP" and request.stop_price is None:
+            raise HTTPException(status_code=400, detail="stop_price required for STP")
+        if order_type == "STP LMT" and (request.limit_price is None or request.stop_price is None):
+            raise HTTPException(status_code=400, detail="limit_price and stop_price required for STP LMT")
+        if not request.client_order_key.strip():
+            raise HTTPException(status_code=400, detail="client_order_key required")
+
+        type_map = {
+            "MKT": OrderType.MARKET,
+            "LMT": OrderType.LIMIT,
+            "STP": OrderType.STOP,
+            "STP LMT": OrderType.STOP_LIMIT,
+        }
+
+        cmd = PlaceOrderCommand(
+            symbol=request.symbol,
+            action=OrderAction.BUY if action == "BUY" else OrderAction.SELL,
+            quantity=request.quantity,
+            order_type=type_map[order_type],
+            limit_price=request.limit_price,
+            stop_price=request.stop_price,
+            time_in_force=request.time_in_force,
+            client_order_key=request.client_order_key,
+            max_retries=request.max_retries,
+        )
+        result = _execute_sync(cmd, timeout=20)
+        if not result.success:
+            raise HTTPException(status_code=400, detail=result.error or "Order failed")
+        return {"success": True, "data": result.data}
+
+    @app.post("/api/orders/cancel")
+    async def cancel_order(request: OrderCancelRequest):
+        """Cancel order via engine."""
+        cmd = CancelOrderCommand(order_id=request.order_id)
+        result = _execute_sync(cmd, timeout=15)
+        if not result.success:
+            raise HTTPException(status_code=400, detail=result.error or "Cancel failed")
+        return {"success": True, "data": result.data}
+
+    @app.get("/api/orders")
+    async def get_orders():
+        """Get orders snapshot (engine reconciles open orders)."""
+        cmd = GetOrdersCommand()
+        result = _execute_sync(cmd, timeout=10)
+        if not result.success:
+            raise HTTPException(status_code=400, detail=result.error or "Get orders failed")
+        return {"success": True, "data": result.data}
+
+    # ==================== Guardrails ====================
+
+    @app.get("/api/guardrails")
+    async def get_guardrails():
+        """Get guardrails status."""
+        cmd = GetGuardrailsStatusCommand()
+        result = _execute_sync(cmd, timeout=10)
+        if not result.success:
+            raise HTTPException(status_code=400, detail=result.error or "Guardrails unavailable")
+        return {"success": True, "data": result.data}
+
+    @app.post("/api/kill-switch")
+    async def activate_kill_switch(reason: str = "Manual activation"):
+        """Activate kill switch manually."""
+        cmd = ActivateKillSwitchCommand(reason=reason)
+        result = _execute_sync(cmd, timeout=10)
+        if not result.success:
+            raise HTTPException(status_code=400, detail=result.error or "Kill switch failed")
+        return {"success": True, "data": result.data}
 
     # ==================== Streaming ====================
 
     @app.post("/api/stream/subscribe")
     async def subscribe_stream(request: StreamRequest):
         """Suscribe a streaming de símbolos."""
-        stream = app_state.get("stream")
+        results = {}
+        for symbol in request.symbols:
+            cmd = SubscribeMarketDataCommand(symbol=symbol)
+            result = _execute_sync(cmd, timeout=10)
+            results[symbol] = result.success
 
-        if not stream:
-            raise HTTPException(status_code=400, detail="No hay conexión con IB")
-
-        try:
-            results = await stream.subscribe_multiple(request.symbols)
-
-            return {
-                "success": True,
-                "subscriptions": results,
-            }
-
-        except Exception as e:
-            logger.error(f"Error suscribiendo: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+        return {
+            "success": True,
+            "subscriptions": results,
+        }
 
     @app.post("/api/stream/unsubscribe")
     async def unsubscribe_stream(symbol: str):
         """Cancela suscripción de un símbolo."""
-        stream = app_state.get("stream")
-
-        if not stream:
-            raise HTTPException(status_code=400, detail="No hay conexión con IB")
-
-        try:
-            success = await stream.unsubscribe(symbol)
-            return {"success": success}
-
-        except Exception as e:
-            logger.error(f"Error desuscribiendo: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+        cmd = UnsubscribeMarketDataCommand(symbol=symbol)
+        result = _execute_sync(cmd, timeout=10)
+        return {"success": result.success}
 
     @app.get("/api/stream/latest")
     async def get_latest_prices():
         """Obtiene últimos precios de símbolos suscritos."""
-        stream = app_state.get("stream")
-
-        if not stream:
+        engine = app_state.get("engine")
+        if not engine:
             return {"prices": {}}
 
-        latest = stream.get_all_latest()
-
-        prices = {}
-        for symbol, tick in latest.items():
-            prices[symbol] = tick.to_dict()
-
+        prices = engine.state.get_all_market_data()
         return {"prices": prices}
 
     # ==================== Estrategias ====================
@@ -354,22 +452,9 @@ def register_routes(app: FastAPI):
         logger.info("Cliente WebSocket conectado")
 
         try:
-            stream = app_state.get("stream")
-
-            if stream:
-                # Callback para enviar datos a WebSocket
-                def send_tick(tick: TickData):
-                    asyncio.create_task(
-                        broadcast_tick(tick)
-                    )
-
-                stream.add_global_callback(send_tick)
-
+            # Engine-based: clients should call /api/stream/latest
             while True:
-                # Mantener conexión y procesar mensajes
                 data = await websocket.receive_text()
-
-                # Procesar comandos del cliente
                 if data == "ping":
                     await websocket.send_text("pong")
 
@@ -378,20 +463,6 @@ def register_routes(app: FastAPI):
         finally:
             if websocket in app_state["websocket_clients"]:
                 app_state["websocket_clients"].remove(websocket)
-
-
-async def broadcast_tick(tick: TickData):
-    """Envía tick a todos los clientes WebSocket."""
-    message = {
-        "type": "tick",
-        "data": tick.to_dict(),
-    }
-
-    for client in app_state["websocket_clients"]:
-        try:
-            await client.send_json(message)
-        except Exception:
-            pass
 
 
 def get_dashboard_html() -> str:
@@ -431,7 +502,7 @@ def get_dashboard_html() -> str:
         <!-- Conexion -->
         <div class="card">
             <h2 class="text-xl font-semibold mb-4">Conexion IB</h2>
-            <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-4">
+            <div class="grid grid-cols-1 md:grid-cols-6 gap-4 mb-4">
                 <div>
                     <label class="block text-sm font-medium mb-1">Host</label>
                     <input type="text" id="host" value="127.0.0.1" class="input">
@@ -443,6 +514,19 @@ def get_dashboard_html() -> str:
                 <div>
                     <label class="block text-sm font-medium mb-1">Client ID</label>
                     <input type="number" id="client-id" value="1" class="input">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium mb-1">Modo</label>
+                    <select id="mode" class="input">
+                        <option value="paper" selected>Paper</option>
+                        <option value="live">Live</option>
+                    </select>
+                </div>
+                <div class="flex items-end">
+                    <label class="inline-flex items-center text-sm">
+                        <input type="checkbox" id="confirm-live" class="mr-2">
+                        Confirmar Live
+                    </label>
                 </div>
                 <div class="flex items-end gap-2">
                     <button onclick="connect()" class="btn btn-primary">Conectar</button>
@@ -567,7 +651,6 @@ def get_dashboard_html() -> str:
 
     <script>
         let priceChart = null;
-        let ws = null;
         const streamData = {};
 
         // Utilidades
@@ -594,14 +677,21 @@ def get_dashboard_html() -> str:
             const host = document.getElementById('host').value;
             const port = parseInt(document.getElementById('port').value);
             const clientId = parseInt(document.getElementById('client-id').value);
+            const mode = document.getElementById('mode').value;
+            const confirmLive = document.getElementById('confirm-live').checked;
+
+            if (mode === 'live' && !confirmLive) {
+                log('Debes confirmar Live antes de conectar');
+                return;
+            }
 
             log('Conectando a IB...');
             try {
-                const result = await api('/connect', 'POST', { host, port, client_id: clientId });
+                const result = await api('/connect', 'POST', { host, port, client_id: clientId, mode, confirm_live: confirmLive });
                 if (result.success) {
                     log('Conectado exitosamente');
                     updateStatus(true);
-                    connectWebSocket();
+                    startStreamPolling();
                 }
             } catch (e) {
                 log('Error: ' + e.message);
@@ -614,29 +704,49 @@ def get_dashboard_html() -> str:
                 await api('/disconnect', 'POST');
                 log('Desconectado');
                 updateStatus(false);
-                if (ws) ws.close();
+                stopStreamPolling();
             } catch (e) {
                 log('Error: ' + e.message);
             }
         }
 
-        function updateStatus(connected) {
+                function updatePortForMode() {
+            const mode = document.getElementById('mode').value;
+            const portInput = document.getElementById('port');
+            portInput.value = mode === 'live' ? 7496 : 7497;
+        }
+
+function updateStatus(connected) {
             const indicator = document.getElementById('status-indicator');
             const text = document.getElementById('status-text');
             indicator.className = `w-3 h-3 rounded-full ${connected ? 'bg-green-500' : 'bg-red-500'}`;
             text.textContent = connected ? 'Conectado' : 'Desconectado';
         }
 
-        // WebSocket
-        function connectWebSocket() {
-            ws = new WebSocket(`ws://${window.location.host}/ws`);
-            ws.onmessage = (event) => {
-                const msg = JSON.parse(event.data);
-                if (msg.type === 'tick') {
-                    updateStreamTable(msg.data);
+        // Streaming polling
+        let streamInterval = null;
+
+        async function pollStream() {
+            try {
+                const result = await api('/stream/latest');
+                const prices = result.prices || {};
+                for (const tick of Object.values(prices)) {
+                    updateStreamTable(tick);
                 }
-            };
-            ws.onclose = () => log('WebSocket desconectado');
+            } catch (e) {
+                // silent
+            }
+        }
+
+        function startStreamPolling() {
+            if (streamInterval) return;
+            streamInterval = setInterval(pollStream, 1000);
+        }
+
+        function stopStreamPolling() {
+            if (!streamInterval) return;
+            clearInterval(streamInterval);
+            streamInterval = null;
         }
 
         // Datos historicos
@@ -667,10 +777,10 @@ def get_dashboard_html() -> str:
             priceChart = new Chart(ctx, {
                 type: 'line',
                 data: {
-                    labels: data.map(d => d.date ? d.date.split('T')[0] : ''),
+                    labels: data.map(d => d.Date ? d.Date.split('T')[0] : ''),
                     datasets: [{
                         label: 'Precio',
-                        data: data.map(d => d.close),
+                        data: data.map(d => d.Close),
                         borderColor: 'rgb(59, 130, 246)',
                         tension: 0.1,
                         fill: false,
@@ -786,7 +896,9 @@ def get_dashboard_html() -> str:
         async function init() {
             const status = await api('/status');
             updateStatus(status.connected);
-            if (status.connected) connectWebSocket();
+            updatePortForMode();
+            document.getElementById('mode').addEventListener('change', updatePortForMode);
+            if (status.connected) startStreamPolling();
             loadStrategies();
             log('Dashboard iniciado');
         }

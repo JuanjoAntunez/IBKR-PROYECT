@@ -31,6 +31,9 @@ class CommandType(Enum):
     GET_ORDERS = "get_orders"
     PLACE_ORDER = "place_order"
     CANCEL_ORDER = "cancel_order"
+    GET_GUARDRAILS_STATUS = "get_guardrails_status"
+    ACTIVATE_KILL_SWITCH = "activate_kill_switch"
+    GET_MARKET_SUBSCRIPTIONS = "get_market_subscriptions"
     SUBSCRIBE_MARKET_DATA = "subscribe_market_data"
     UNSUBSCRIBE_MARKET_DATA = "unsubscribe_market_data"
 
@@ -81,6 +84,7 @@ class ConnectCommand(Command):
     client_id: int = 1
     timeout: int = 10
     mode: str = "paper"  # "paper" or "live"
+    confirm_live: bool = False  # Require explicit confirmation for live mode
 
     @property
     def command_type(self) -> CommandType:
@@ -168,6 +172,34 @@ class GetOrdersCommand(Command):
         return CommandType.GET_ORDERS
 
 
+@dataclass
+class GetMarketSubscriptionsCommand(Command):
+    """Command to get active market data subscriptions."""
+
+    @property
+    def command_type(self) -> CommandType:
+        return CommandType.GET_MARKET_SUBSCRIPTIONS
+
+
+@dataclass
+class GetGuardrailsStatusCommand(Command):
+    """Command to get guardrails status."""
+
+    @property
+    def command_type(self) -> CommandType:
+        return CommandType.GET_GUARDRAILS_STATUS
+
+
+@dataclass
+class ActivateKillSwitchCommand(Command):
+    """Command to activate kill switch manually."""
+    reason: str = "Manual activation"
+
+    @property
+    def command_type(self) -> CommandType:
+        return CommandType.ACTIVATE_KILL_SWITCH
+
+
 # =============================================================================
 # Order Commands
 # =============================================================================
@@ -196,6 +228,8 @@ class PlaceOrderCommand(Command):
     limit_price: Optional[float] = None
     stop_price: Optional[float] = None
     time_in_force: str = "DAY"  # DAY, GTC, IOC, FOK
+    client_order_key: Optional[str] = None  # Idempotency key from client
+    max_retries: int = 0  # Controlled retries on submit failure
 
     @property
     def command_type(self) -> CommandType:
@@ -210,6 +244,8 @@ class PlaceOrderCommand(Command):
         if self.order_type == OrderType.LIMIT and self.limit_price is None:
             return False
         if self.order_type == OrderType.STOP and self.stop_price is None:
+            return False
+        if self.client_order_key is not None and not str(self.client_order_key).strip():
             return False
         return True
 

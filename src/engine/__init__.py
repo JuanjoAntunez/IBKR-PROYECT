@@ -15,8 +15,13 @@ from .commands import (
     GetAccountCommand,
     GetPositionsCommand,
     GetOrdersCommand,
+    GetGuardrailsStatusCommand,
+    ActivateKillSwitchCommand,
+    GetMarketSubscriptionsCommand,
     PlaceOrderCommand,
     CancelOrderCommand,
+    SubscribeMarketDataCommand,
+    UnsubscribeMarketDataCommand,
     OrderAction,
     OrderType,
 )
@@ -46,6 +51,8 @@ from .guardrails import (
     ValidationResult,
 )
 from .audit_log import AuditLog, AuditEntry, get_audit_log
+from .order_manager import OrderManager
+from .market_data import MarketDataService
 from .notifications import (
     NotificationManager,
     NotificationChannel,
@@ -69,8 +76,13 @@ __all__ = [
     "GetAccountCommand",
     "GetPositionsCommand",
     "GetOrdersCommand",
+    "GetGuardrailsStatusCommand",
+    "ActivateKillSwitchCommand",
+    "GetMarketSubscriptionsCommand",
     "PlaceOrderCommand",
     "CancelOrderCommand",
+    "SubscribeMarketDataCommand",
+    "UnsubscribeMarketDataCommand",
     "OrderAction",
     "OrderType",
     # State
@@ -98,6 +110,10 @@ __all__ = [
     "AuditLog",
     "AuditEntry",
     "get_audit_log",
+    # Order Manager
+    "OrderManager",
+    # Market Data
+    "MarketDataService",
     # Notifications
     "NotificationManager",
     "NotificationChannel",

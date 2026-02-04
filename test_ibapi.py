@@ -1,113 +1,62 @@
 """
-Test de conexion con TWS usando la API oficial de Interactive Brokers
+Test de conexión con TWS usando ib_insync.
 """
 
-from ibapi.client import EClient
-from ibapi.wrapper import EWrapper
-from ibapi.contract import Contract
-import threading
+from ib_insync import IB
 import time
 
 
-class IBApp(EWrapper, EClient):
-    """Aplicacion simple de IB API."""
-    
-    def __init__(self):
-        EClient.__init__(self, self)
-        self.connected = False
-        self.accounts = []
-        self.net_liquidation = None
-        
-    def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=""):
-        """Manejo de errores."""
-        # Filtrar warnings comunes
-        if errorCode in [2104, 2106, 2158]:
-            print(f"Info: {errorString}")
-        elif errorCode >= 2000:
-            print(f"Warning [{errorCode}]: {errorString}")
-        else:
-            print(f"Error [{errorCode}]: {errorString}")
-    
-    def connectAck(self):
-        """Confirmacion de conexion."""
-        print("✓ Conexion establecida")
-        self.connected = True
-    
-    def managedAccounts(self, accountsList):
-        """Recibe la lista de cuentas."""
-        self.accounts = accountsList.split(',')
-        print(f"Cuentas disponibles: {self.accounts}")
-    
-    def accountSummary(self, reqId, account, tag, value, currency):
-        """Recibe valores de resumen de cuenta."""
-        if tag == "NetLiquidation":
-            self.net_liquidation = f"{value} {currency}"
-            print(f"Valor de cuenta ({account}): {value} {currency}")
-
-
 def main():
-    """Funcion principal."""
+    """Función principal."""
     print("=" * 60)
-    print("TEST DE CONEXION CON IB TWS - API OFICIAL")
+    print("TEST DE CONEXION CON IB TWS - ib_insync")
     print("=" * 60)
-    
-    # Configuracion
-    HOST = '127.0.0.1'
+
+    # Configuración
+    HOST = "127.0.0.1"
     PORT = 7496  # Cambia a 7497 para Paper Trading
     CLIENT_ID = 1
-    
-    # Crear aplicacion
-    app = IBApp()
-    
+
+    ib = IB()
+
     try:
         print(f"\nIntentando conectar a {HOST}:{PORT}...")
-        
-        # Conectar
-        app.connect(HOST, PORT, CLIENT_ID)
-        
-        # Iniciar thread de la API
-        api_thread = threading.Thread(target=app.run, daemon=True)
-        api_thread.start()
-        
-        # Esperar a que se establezca la conexion
-        timeout = 10
-        start_time = time.time()
-        
-        while not app.connected and (time.time() - start_time) < timeout:
-            time.sleep(0.1)
-        
-        if not app.connected:
-            print("\n✗ Timeout: No se pudo conectar")
-            print("\nVerifica:")
-            print("1. TWS esta abierto y logueado")
-            print("2. Puerto correcto (7496=Live, 7497=Paper)")
-            print("3. API habilitada en TWS:")
-            print("   File → Global Configuration → API → Settings")
-            print("   ✓ Enable ActiveX and Socket Clients")
-            return
-        
-        print("\n✓ CONEXION EXITOSA!")
-        
-        # Esperar a recibir cuentas
+        ib.connect(HOST, PORT, clientId=CLIENT_ID)
+
         time.sleep(2)
-        
-        # Solicitar resumen de cuenta si hay cuentas disponibles
-        if app.accounts:
-            print(f"\nSolicitando resumen de cuenta...")
-            app.reqAccountSummary(1, "All", "NetLiquidation")
-            time.sleep(3)
-        
-        print("\n✓ Test completado exitosamente")
-        
+
+        if ib.isConnected():
+            print("✓ CONEXION EXITOSA!")
+            accounts = ib.managedAccounts()
+            print(f"Cuentas disponibles: {accounts}")
+
+            # Obtener algunos valores de cuenta
+            account_values = ib.accountValues()
+            for av in account_values:
+                if av.tag == "NetLiquidation":
+                    print(f"Valor de cuenta: {av.value} {av.currency}")
+
+            print("\n✓ Test completado exitosamente")
+        else:
+            print("✗ No se pudo conectar")
+
+    except ConnectionRefusedError:
+        print("\n✗ ERROR: Conexion rechazada")
+        print("\nVerifica:")
+        print("1. TWS esta abierto y logueado")
+        print("2. Puerto correcto (7496=Live, 7497=Paper)")
+        print("3. API habilitada en TWS:")
+        print("   File → Global Configuration → API → Settings")
+        print("   ✓ Enable ActiveX and Socket Clients")
+
     except Exception as e:
         print(f"\n✗ ERROR: {e}")
-        
+
     finally:
-        # Desconectar
-        if app.isConnected():
-            app.disconnect()
+        if ib.isConnected():
+            ib.disconnect()
             print("\n✓ Desconectado")
-        
+
         print("\n" + "=" * 60)
 
 

@@ -5,7 +5,10 @@ Bridge between Streamlit frontend and Trading Engine.
 Handles async communication and state synchronization.
 """
 
-import streamlit as st
+try:
+    import streamlit as st
+except ImportError:  # Allow usage outside Streamlit (CLI/tests)
+    st = None
 from typing import Optional, Any, Callable
 from datetime import datetime
 import time
@@ -23,6 +26,11 @@ from .commands import (
     GetPositionsCommand,
     PlaceOrderCommand,
     CancelOrderCommand,
+    GetGuardrailsStatusCommand,
+    ActivateKillSwitchCommand,
+    GetMarketSubscriptionsCommand,
+    SubscribeMarketDataCommand,
+    UnsubscribeMarketDataCommand,
     OrderAction,
     OrderType,
 )
@@ -66,7 +74,8 @@ class EngineAdapter:
         port: int = 7497,
         client_id: int = 1,
         mode: str = "paper",
-        timeout: int = 15
+        timeout: int = 15,
+        confirm_live: bool = False,
     ) -> tuple[bool, Optional[str], Optional[dict]]:
         """
         Connect to IB synchronously.
@@ -82,6 +91,7 @@ class EngineAdapter:
             client_id=client_id,
             timeout=timeout,
             mode=mode,
+            confirm_live=confirm_live,
         )
 
         result = self._execute_sync(cmd, timeout=timeout + 5)
@@ -169,6 +179,8 @@ class EngineAdapter:
         order_type: str = "MKT",  # "MKT", "LMT", "STP"
         limit_price: Optional[float] = None,
         stop_price: Optional[float] = None,
+        client_order_key: Optional[str] = None,
+        max_retries: int = 0,
         timeout: int = 10
     ) -> tuple[bool, Optional[str], Optional[int]]:
         """
@@ -198,6 +210,8 @@ class EngineAdapter:
             order_type=order_type_enum,
             limit_price=limit_price,
             stop_price=stop_price,
+            client_order_key=client_order_key,
+            max_retries=max_retries,
         )
 
         result = self._execute_sync(cmd, timeout=timeout)
@@ -216,6 +230,49 @@ class EngineAdapter:
         cmd = CancelOrderCommand(order_id=order_id)
         result = self._execute_sync(cmd, timeout=timeout)
 
+        return result.success, result.error
+
+    def subscribe_market_data(self, symbol: str, timeout: int = 10) -> tuple[bool, Optional[str], Optional[dict]]:
+        """Subscribe to real-time market data."""
+        self.ensure_running()
+        cmd = SubscribeMarketDataCommand(symbol=symbol)
+        result = self._execute_sync(cmd, timeout=timeout)
+        if result.success:
+            return True, None, result.data
+        return False, result.error, None
+
+    def unsubscribe_market_data(self, symbol: str, timeout: int = 10) -> tuple[bool, Optional[str], Optional[dict]]:
+        """Unsubscribe from real-time market data."""
+        self.ensure_running()
+        cmd = UnsubscribeMarketDataCommand(symbol=symbol)
+        result = self._execute_sync(cmd, timeout=timeout)
+        if result.success:
+            return True, None, result.data
+        return False, result.error, None
+
+    def get_market_subscriptions(self, timeout: int = 10) -> tuple[bool, Optional[str], Optional[dict]]:
+        """Get active market data subscriptions."""
+        self.ensure_running()
+        cmd = GetMarketSubscriptionsCommand()
+        result = self._execute_sync(cmd, timeout=timeout)
+        if result.success:
+            return True, None, result.data
+        return False, result.error, None
+
+    def get_guardrails_status(self, timeout: int = 10) -> tuple[bool, Optional[str], Optional[dict]]:
+        """Get guardrails status."""
+        self.ensure_running()
+        cmd = GetGuardrailsStatusCommand()
+        result = self._execute_sync(cmd, timeout=timeout)
+        if result.success:
+            return True, None, result.data
+        return False, result.error, None
+
+    def activate_kill_switch(self, reason: str = "Manual activation", timeout: int = 10) -> tuple[bool, Optional[str]]:
+        """Activate kill switch manually."""
+        self.ensure_running()
+        cmd = ActivateKillSwitchCommand(reason=reason)
+        result = self._execute_sync(cmd, timeout=timeout)
         return result.success, result.error
 
     # =========================================================================
@@ -241,6 +298,10 @@ class EngineAdapter:
     def get_cached_orders(self) -> dict:
         """Get cached orders (no IB request)."""
         return self._engine.get_orders()
+
+    def get_cached_market_data(self) -> dict:
+        """Get cached market data (no IB request)."""
+        return self._engine.state.get_all_market_data()
 
     def get_active_orders(self) -> list:
         """Get active orders."""
@@ -298,6 +359,8 @@ def get_adapter() -> EngineAdapter:
 
     This ensures a single adapter instance per session.
     """
+    if st is None:
+        return EngineAdapter()
     if 'engine_adapter' not in st.session_state:
         st.session_state.engine_adapter = EngineAdapter()
     return st.session_state.engine_adapter
@@ -305,6 +368,8 @@ def get_adapter() -> EngineAdapter:
 
 def init_engine_state():
     """Initialize engine-related session state variables."""
+    if st is None:
+        return
     defaults = {
         'engine_initialized': False,
         'last_fetch_symbol': None,

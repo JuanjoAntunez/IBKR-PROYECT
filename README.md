@@ -11,6 +11,17 @@ Sistema de trading automatizado usando Interactive Brokers API con Python.
 - ✅ Type hints completos
 - ✅ Async/await nativo
 - ✅ Preparado para Claude Code
+- ✅ Trading Engine single-writer con guardrails de seguridad
+
+## 🧠 Arquitectura (Single Writer)
+
+El sistema opera con un **Trading Engine** centralizado (`src/engine`) que es el único
+responsable de conectar a IB, enviar órdenes y reconciliar estado. Los frontends
+(Streamlit y FastAPI) solo envían comandos al engine.
+
+Notas:
+- El stack antiguo está aislado en `src/legacy` y no forma parte del flujo actual.
+- El ejemplo principal (`main.py`) ya usa el engine para evitar accesos directos a IB.
 
 ## 📋 Requisitos Previos
 
