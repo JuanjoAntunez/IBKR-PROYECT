@@ -16,6 +16,15 @@ loguru==0.7.2
 pytest==7.4.3
 pytest-asyncio==0.21.1
 
+# Web Dashboard
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+websockets==12.0
+pydantic==2.5.3
+
+# Data storage
+pyarrow==14.0.2
+
 # Optional: Technical indicators
 ta-lib==0.4.28  # Requiere instalación manual de TA-Lib C library
 # Alternativa sin dependencias C: pandas-ta==0.3.14b0

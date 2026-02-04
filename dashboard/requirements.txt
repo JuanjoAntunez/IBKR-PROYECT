@@ -1,0 +1,17 @@
+# Dashboard de Trading - Dependencias
+# ====================================
+
+# Framework web
+streamlit>=1.28.0
+
+# Visualización
+plotly>=5.18.0
+
+# Procesamiento de datos
+pandas>=2.0.0
+
+# API de Interactive Brokers
+ibapi>=9.81.1
+
+# Utilidades adicionales (opcional, para desarrollo)
+# watchdog>=3.0.0  # Para hot-reload de Streamlit
