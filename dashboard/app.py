@@ -56,8 +56,119 @@ st.markdown("""
         max-height: 300px;
         overflow-y: auto;
     }
+    /* Modo Paper - Verde */
+    .mode-paper {
+        background: linear-gradient(90deg, #00c853 0%, #69f0ae 100%);
+        color: white;
+        padding: 10px 20px;
+        border-radius: 10px;
+        text-align: center;
+        font-weight: bold;
+        font-size: 16px;
+        margin-bottom: 10px;
+        box-shadow: 0 2px 10px rgba(0, 200, 83, 0.3);
+    }
+    /* Modo Live - Rojo */
+    .mode-live {
+        background: linear-gradient(90deg, #ff1744 0%, #ff5252 100%);
+        color: white;
+        padding: 10px 20px;
+        border-radius: 10px;
+        text-align: center;
+        font-weight: bold;
+        font-size: 16px;
+        margin-bottom: 10px;
+        box-shadow: 0 2px 10px rgba(255, 23, 68, 0.3);
+        animation: pulse-live 2s infinite;
+    }
+    @keyframes pulse-live {
+        0% { box-shadow: 0 0 0 0 rgba(255, 23, 68, 0.7); }
+        70% { box-shadow: 0 0 0 10px rgba(255, 23, 68, 0); }
+        100% { box-shadow: 0 0 0 0 rgba(255, 23, 68, 0); }
+    }
+    /* Badge de modo */
+    .badge-paper {
+        background-color: #00c853;
+        color: white;
+        padding: 3px 8px;
+        border-radius: 12px;
+        font-size: 11px;
+        font-weight: bold;
+    }
+    .badge-live {
+        background-color: #ff1744;
+        color: white;
+        padding: 3px 8px;
+        border-radius: 12px;
+        font-size: 11px;
+        font-weight: bold;
+    }
+    /* Warning box para Live */
+    .live-warning {
+        background-color: rgba(255, 23, 68, 0.1);
+        border-left: 4px solid #ff1744;
+        padding: 15px;
+        margin: 10px 0;
+        border-radius: 0 8px 8px 0;
+    }
+    .live-warning h4 {
+        color: #ff1744;
+        margin: 0 0 10px 0;
+    }
+    /* Conexión status mejorado */
+    .connection-status {
+        padding: 8px 12px;
+        border-radius: 8px;
+        font-size: 13px;
+        margin: 5px 0;
+    }
+    .conn-paper {
+        background-color: rgba(0, 200, 83, 0.15);
+        border: 1px solid #00c853;
+        color: #00c853;
+    }
+    .conn-live {
+        background-color: rgba(255, 23, 68, 0.15);
+        border: 1px solid #ff1744;
+        color: #ff1744;
+    }
+    .conn-disconnected {
+        background-color: rgba(158, 158, 158, 0.15);
+        border: 1px solid #9e9e9e;
+        color: #9e9e9e;
+    }
 </style>
 """, unsafe_allow_html=True)
+
+
+# =============================================================================
+# Constantes y configuración de puertos
+# =============================================================================
+PORT_MAP = {
+    ("TWS", "paper"): 7497,
+    ("TWS", "live"): 7496,
+    ("Gateway", "paper"): 4002,
+    ("Gateway", "live"): 4001,
+}
+
+DEFAULT_CONFIG = {
+    "mode": "paper",
+    "platform": "TWS",
+    "host": "127.0.0.1",
+    "client_id": 1,
+    "timeout": 10,
+}
+
+
+def get_port(platform, mode):
+    """Obtiene el puerto según plataforma y modo."""
+    return PORT_MAP.get((platform, mode), 7497)
+
+
+def log_mode_change(old_mode, new_mode, platform, port):
+    """Log de cambio de modo para auditoría."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] MODE CHANGE: {old_mode} → {new_mode} | Platform: {platform} | Port: {port}")
 
 
 # =============================================================================
@@ -179,7 +290,7 @@ class IBApp(EWrapper, EClient):
 # =============================================================================
 # Funciones de conexión - MISMA LÓGICA que test_ibapi.py
 # =============================================================================
-def connect_to_ib(host, port, client_id):
+def connect_to_ib(host, port, client_id, timeout=10, mode="paper"):
     """
     Conecta a IB usando EXACTAMENTE la misma lógica que test_ibapi.py.
 
@@ -187,7 +298,9 @@ def connect_to_ib(host, port, client_id):
         tuple: (app, error_message, debug_messages)
     """
     debug = []
-    debug.append(f"Iniciando conexión a {host}:{port} con client_id={client_id}")
+    mode_str = "PAPER (Simulación)" if mode == "paper" else "LIVE (Dinero Real)"
+    debug.append(f"[{mode_str}] Iniciando conexión a {host}:{port} con client_id={client_id}")
+    print(f"[IB] Conectando en modo {mode_str} a puerto {port}")
 
     # Crear aplicacion - IGUAL que test_ibapi.py
     app = IBApp()
@@ -207,7 +320,6 @@ def connect_to_ib(host, port, client_id):
         debug.append("Thread iniciado, esperando connectAck...")
 
         # Esperar a que se establezca la conexion - IGUAL que test_ibapi.py
-        timeout = 10
         start_time = time.time()
 
         while not app.connected and (time.time() - start_time) < timeout:
@@ -502,7 +614,9 @@ def create_candlestick_chart(df, symbol):
 def main():
     """Función principal del dashboard."""
 
+    # =========================================================================
     # Inicializar estado de sesión
+    # =========================================================================
     if 'connection_status' not in st.session_state:
         st.session_state.connection_status = False
     if 'connection_info' not in st.session_state:
@@ -513,36 +627,142 @@ def main():
         st.session_state.last_symbol = None
     if 'debug_log' not in st.session_state:
         st.session_state.debug_log = []
+    # Nuevos estados para modo trading
+    if 'trading_mode' not in st.session_state:
+        st.session_state.trading_mode = "paper"  # Por defecto SIEMPRE paper
+    if 'platform' not in st.session_state:
+        st.session_state.platform = "TWS"
+    if 'live_confirmed' not in st.session_state:
+        st.session_state.live_confirmed = False
+    if 'host' not in st.session_state:
+        st.session_state.host = "127.0.0.1"
+    if 'client_id' not in st.session_state:
+        st.session_state.client_id = 1
+    if 'timeout' not in st.session_state:
+        st.session_state.timeout = 10
+    if 'portfolio_data' not in st.session_state:
+        st.session_state.portfolio_data = None
+    if 'account_data' not in st.session_state:
+        st.session_state.account_data = None
 
     # =========================================================================
     # SIDEBAR
     # =========================================================================
     with st.sidebar:
         st.title("📊 IB Dashboard")
+
+        # =================================================================
+        # SELECTOR DE MODO (arriba de todo)
+        # =================================================================
         st.markdown("---")
+        st.subheader("🎯 Modo de Trading")
 
-        # Configuración de conexión
-        st.subheader("⚙️ Conexión")
+        # Radio buttons para modo
+        mode_options = {
+            "paper": "🟢 Paper Trading (Simulación)",
+            "live": "🔴 Live Trading (Dinero Real)"
+        }
 
-        col1, col2 = st.columns(2)
-        with col1:
-            host = st.text_input("Host", value="127.0.0.1", key="host")
-        with col2:
-            # Puerto 7496 por defecto (como test_ibapi.py)
-            port = st.number_input(
-                "Puerto",
-                value=7496,
-                min_value=1,
-                max_value=65535,
-                help="7496=Live TWS (default), 7497=Paper TWS"
+        selected_mode = st.radio(
+            "Selecciona el modo:",
+            options=list(mode_options.keys()),
+            format_func=lambda x: mode_options[x],
+            index=0 if st.session_state.trading_mode == "paper" else 1,
+            key="mode_selector"
+        )
+
+        # Detectar cambio de modo
+        if selected_mode != st.session_state.trading_mode:
+            old_mode = st.session_state.trading_mode
+            # Si cambia a live, resetear confirmación
+            if selected_mode == "live":
+                st.session_state.live_confirmed = False
+            # Desconectar al cambiar modo
+            st.session_state.connection_status = False
+            st.session_state.connection_info = None
+            st.session_state.trading_mode = selected_mode
+            # Log del cambio
+            port = get_port(st.session_state.platform, selected_mode)
+            log_mode_change(old_mode, selected_mode, st.session_state.platform, port)
+
+        # Warning y confirmación para Live
+        if st.session_state.trading_mode == "live":
+            st.markdown("""
+            <div class="live-warning">
+                <h4>⚠️ ADVERTENCIA</h4>
+                <p>Vas a conectar a tu cuenta <strong>REAL</strong>.</p>
+                <p>Las órdenes ejecutadas afectarán tu dinero real.</p>
+            </div>
+            """, unsafe_allow_html=True)
+
+            live_confirm = st.checkbox(
+                "✅ Entiendo que estoy usando dinero real",
+                value=st.session_state.live_confirmed,
+                key="live_confirm_checkbox"
             )
+            st.session_state.live_confirmed = live_confirm
 
-        # Client ID 1 por defecto (como test_ibapi.py)
-        client_id = st.number_input("Client ID", value=1, min_value=1, max_value=999)
+            if not live_confirm:
+                st.error("⛔ Debes confirmar para usar modo Live")
+
+        # =================================================================
+        # SELECTOR DE PLATAFORMA
+        # =================================================================
+        st.markdown("---")
+        st.subheader("🖥️ Plataforma")
+
+        platform = st.selectbox(
+            "Selecciona plataforma:",
+            options=["TWS", "Gateway"],
+            index=0 if st.session_state.platform == "TWS" else 1,
+            help="TWS = Trader Workstation, Gateway = IB Gateway"
+        )
+
+        if platform != st.session_state.platform:
+            st.session_state.platform = platform
+            st.session_state.connection_status = False
+
+        # Calcular puerto automáticamente
+        port = get_port(st.session_state.platform, st.session_state.trading_mode)
+
+        # Mostrar puerto detectado
+        mode_label = "Paper" if st.session_state.trading_mode == "paper" else "Live"
+        st.info(f"📡 Puerto: **{port}** ({st.session_state.platform} {mode_label})")
+
+        # =================================================================
+        # CONFIGURACIÓN AVANZADA
+        # =================================================================
+        with st.expander("⚙️ Configuración avanzada"):
+            host = st.text_input(
+                "Host",
+                value=st.session_state.host,
+                key="host_input"
+            )
+            st.session_state.host = host
+
+            client_id = st.number_input(
+                "Client ID",
+                value=st.session_state.client_id,
+                min_value=1,
+                max_value=999,
+                key="client_id_input"
+            )
+            st.session_state.client_id = client_id
+
+            timeout = st.number_input(
+                "Timeout (segundos)",
+                value=st.session_state.timeout,
+                min_value=5,
+                max_value=60,
+                key="timeout_input"
+            )
+            st.session_state.timeout = timeout
 
         st.markdown("---")
 
-        # Selector de símbolo
+        # =================================================================
+        # DATOS DE MERCADO
+        # =================================================================
         st.subheader("📈 Datos de Mercado")
         symbol = st.text_input(
             "Símbolo",
@@ -550,7 +770,6 @@ def main():
             help="Símbolo de la acción (ej: AAPL, MSFT, GOOGL)"
         ).upper()
 
-        # Selector de duración
         duration = st.selectbox(
             "Duración",
             options=["1D", "5D", "1M", "3M", "6M", "1Y"],
@@ -558,7 +777,6 @@ def main():
             help="Período de tiempo"
         )
 
-        # Selector de intervalo
         interval = st.selectbox(
             "Intervalo",
             options=["1min", "5min", "15min", "1h", "1d"],
@@ -568,90 +786,139 @@ def main():
 
         st.markdown("---")
 
-        # Botones de acción
+        # =================================================================
+        # BOTONES DE ACCIÓN
+        # =================================================================
+        # Verificar si puede conectar (Live requiere confirmación)
+        can_connect = st.session_state.trading_mode == "paper" or st.session_state.live_confirmed
+
         col1, col2 = st.columns(2)
 
         with col1:
             connect_btn = st.button(
                 "🔌 Test Conexión",
                 use_container_width=True,
-                type="secondary"
+                type="secondary",
+                disabled=not can_connect
             )
 
         with col2:
             fetch_btn = st.button(
                 "📥 Obtener Datos",
                 use_container_width=True,
-                type="primary"
+                type="primary",
+                disabled=not can_connect
             )
 
-        # Estado de conexión en sidebar
+        # =================================================================
+        # ESTADO DE CONEXIÓN MEJORADO
+        # =================================================================
         st.markdown("---")
-        if st.session_state.connection_status:
-            st.success("✓ Última conexión exitosa")
-        else:
-            st.warning("⚠️ Sin conexión verificada")
 
-        # Info
-        st.markdown("---")
+        if st.session_state.connection_status:
+            mode_class = "conn-paper" if st.session_state.trading_mode == "paper" else "conn-live"
+            mode_icon = "🟢" if st.session_state.trading_mode == "paper" else "🔴"
+            mode_text = "Paper" if st.session_state.trading_mode == "paper" else "Live"
+            st.markdown(f"""
+            <div class="connection-status {mode_class}">
+                {mode_icon} Conectado a: {st.session_state.platform} {mode_text} (Puerto {port})
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown("""
+            <div class="connection-status conn-disconnected">
+                ⚪ Desconectado
+            </div>
+            """, unsafe_allow_html=True)
+
         st.caption(f"**Config:** {host}:{port} (ID:{client_id})")
-        st.caption("💡 Asegúrate de que TWS esté abierto")
+
+    # =========================================================================
+    # INDICADOR GLOBAL DE MODO (Header sticky)
+    # =========================================================================
+    if st.session_state.trading_mode == "paper":
+        st.markdown("""
+        <div class="mode-paper">
+            🟢 MODO SIMULACIÓN - Paper Trading
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown("""
+        <div class="mode-live">
+            ⚠️ MODO REAL ⚠️ - Live Trading - DINERO REAL
+        </div>
+        """, unsafe_allow_html=True)
 
     # =========================================================================
     # ÁREA PRINCIPAL
     # =========================================================================
     st.title(f"📊 Dashboard de Trading - {symbol}")
 
-    # Estado de conexión
+    # Estado de conexión mejorado
     if st.session_state.connection_status:
-        st.markdown('<p class="status-connected">✓ Conectado a Interactive Brokers</p>',
-                   unsafe_allow_html=True)
+        mode_badge = "badge-paper" if st.session_state.trading_mode == "paper" else "badge-live"
+        mode_text = "PAPER" if st.session_state.trading_mode == "paper" else "LIVE"
+        st.markdown(f'''
+        <p class="status-connected">
+            ✓ Conectado a Interactive Brokers
+            <span class="{mode_badge}">{mode_text}</span>
+        </p>
+        ''', unsafe_allow_html=True)
     else:
         st.markdown('<p class="status-disconnected">✗ Haz clic en "Test Conexión" para verificar</p>',
                    unsafe_allow_html=True)
 
     st.markdown("---")
 
-    # Pestañas
-    tab1, tab2, tab3, tab4 = st.tabs(["📈 Datos Históricos", "💼 Portfolio", "🔧 Test Conexión", "🐛 Debug"])
+    # Pestañas (añadida Configuración)
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "📈 Datos Históricos",
+        "💼 Portfolio",
+        "🔧 Test Conexión",
+        "⚙️ Configuración",
+        "🐛 Debug"
+    ])
 
     # =========================================================================
     # TAB 1: Datos Históricos
     # =========================================================================
     with tab1:
         if fetch_btn:
-            with st.spinner(f"📡 Conectando y obteniendo datos de {symbol}..."):
-                # Usar client_id + 1 para no colisionar con test de conexión
-                df, error, debug = fetch_historical_data(
-                    host=host,
-                    port=port,
-                    client_id=client_id + 1,
-                    symbol=symbol,
-                    duration=duration,
-                    bar_size=interval
-                )
+            # Verificar permisos para Live
+            if st.session_state.trading_mode == "live" and not st.session_state.live_confirmed:
+                st.error("⛔ Debes confirmar el modo Live antes de conectar")
+            else:
+                with st.spinner(f"📡 Conectando y obteniendo datos de {symbol}..."):
+                    df, error, debug = fetch_historical_data(
+                        host=st.session_state.host,
+                        port=port,
+                        client_id=st.session_state.client_id + 1,
+                        symbol=symbol,
+                        duration=duration,
+                        bar_size=interval
+                    )
 
-                st.session_state.debug_log = debug
+                    st.session_state.debug_log = debug
 
-                if error:
-                    st.error(f"❌ Error: {error}")
-                    with st.expander("🐛 Ver debug log"):
-                        for msg in debug:
-                            st.text(msg)
-                    st.info("""
-                    **Verifica:**
-                    1. TWS está abierto y logueado
-                    2. Puerto correcto (7496 Live, 7497 Paper)
-                    3. API habilitada en TWS
-                    4. El símbolo es válido
-                    """)
-                elif df is not None and not df.empty:
-                    st.session_state.data = df
-                    st.session_state.last_symbol = symbol
-                    st.session_state.connection_status = True
-                    st.success(f"✓ {len(df)} barras obtenidas")
-                else:
-                    st.warning("⚠️ No se encontraron datos")
+                    if error:
+                        st.error(f"❌ Error: {error}")
+                        with st.expander("🐛 Ver debug log"):
+                            for msg in debug:
+                                st.text(msg)
+                        st.info(f"""
+                        **Verifica:**
+                        1. {st.session_state.platform} está abierto y logueado
+                        2. Puerto correcto ({port} para {st.session_state.platform} {'Paper' if st.session_state.trading_mode == 'paper' else 'Live'})
+                        3. API habilitada en {st.session_state.platform}
+                        4. El símbolo es válido
+                        """)
+                    elif df is not None and not df.empty:
+                        st.session_state.data = df
+                        st.session_state.last_symbol = symbol
+                        st.session_state.connection_status = True
+                        st.success(f"✓ {len(df)} barras obtenidas")
+                    else:
+                        st.warning("⚠️ No se encontraron datos")
 
         # Mostrar datos si existen
         if st.session_state.data is not None and not st.session_state.data.empty:
@@ -734,33 +1001,33 @@ def main():
     with tab2:
         st.subheader("💼 Portfolio y Resumen de Cuenta")
 
-        # Inicializar estado de portfolio
-        if 'portfolio_data' not in st.session_state:
-            st.session_state.portfolio_data = None
-        if 'account_data' not in st.session_state:
-            st.session_state.account_data = None
+        # Verificar permisos para Live
+        can_load = st.session_state.trading_mode == "paper" or st.session_state.live_confirmed
 
         # Botón para cargar portfolio
-        if st.button("🔄 Actualizar Portfolio", type="primary", key="refresh_portfolio"):
-            with st.spinner("📡 Obteniendo portfolio y datos de cuenta..."):
-                portfolio, account, error, debug = fetch_portfolio(
-                    host=host,
-                    port=port,
-                    client_id=client_id + 2
-                )
+        if st.button("🔄 Actualizar Portfolio", type="primary", key="refresh_portfolio", disabled=not can_load):
+            if st.session_state.trading_mode == "live" and not st.session_state.live_confirmed:
+                st.error("⛔ Debes confirmar el modo Live antes de conectar")
+            else:
+                with st.spinner("📡 Obteniendo portfolio y datos de cuenta..."):
+                    portfolio, account_info, error, debug = fetch_portfolio(
+                        host=st.session_state.host,
+                        port=port,
+                        client_id=st.session_state.client_id + 2
+                    )
 
-                st.session_state.debug_log = debug
+                    st.session_state.debug_log = debug
 
-                if error:
-                    st.error(f"❌ Error: {error}")
-                    with st.expander("🐛 Ver debug log"):
-                        for msg in debug:
-                            st.text(msg)
-                else:
-                    st.session_state.portfolio_data = portfolio
-                    st.session_state.account_data = account
-                    st.session_state.connection_status = True
-                    st.success("✓ Portfolio actualizado")
+                    if error:
+                        st.error(f"❌ Error: {error}")
+                        with st.expander("🐛 Ver debug log"):
+                            for msg in debug:
+                                st.text(msg)
+                    else:
+                        st.session_state.portfolio_data = portfolio
+                        st.session_state.account_data = account_info
+                        st.session_state.connection_status = True
+                        st.success("✓ Portfolio actualizado")
 
         # Mostrar datos si existen
         if st.session_state.account_data:
@@ -1002,41 +1269,65 @@ def main():
     # =========================================================================
     with tab3:
         st.subheader("🔧 Test de Conexión con IB")
-        st.caption("Usa la misma lógica que test_ibapi.py")
+
+        # Mostrar modo actual
+        mode_text = "Paper (Simulación)" if st.session_state.trading_mode == "paper" else "Live (Dinero Real)"
+        mode_color = "green" if st.session_state.trading_mode == "paper" else "red"
+        st.markdown(f"**Modo actual:** :{mode_color}[{mode_text}]")
+        st.markdown(f"**Plataforma:** {st.session_state.platform} | **Puerto:** {port}")
 
         if connect_btn:
-            with st.spinner("🔄 Conectando a Interactive Brokers..."):
-                app, error, debug = connect_to_ib(host, port, client_id)
+            if st.session_state.trading_mode == "live" and not st.session_state.live_confirmed:
+                st.error("⛔ Debes confirmar el modo Live antes de conectar")
+            else:
+                with st.spinner(f"🔄 Conectando a {st.session_state.platform} ({mode_text})..."):
+                    app, error, debug = connect_to_ib(
+                        st.session_state.host,
+                        port,
+                        st.session_state.client_id,
+                        timeout=st.session_state.timeout,
+                        mode=st.session_state.trading_mode
+                    )
 
-                st.session_state.debug_log = debug
+                    st.session_state.debug_log = debug
 
-                if error:
-                    st.session_state.connection_status = False
-                    st.session_state.connection_info = {"error": error, "debug": debug}
-                else:
-                    # Solicitar info de cuenta
-                    st.write("Solicitando resumen de cuenta...")
-                    account_info = get_account_summary(app)
+                    if error:
+                        st.session_state.connection_status = False
+                        st.session_state.connection_info = {"error": error, "debug": debug}
+                    else:
+                        # Solicitar info de cuenta
+                        st.write("Solicitando resumen de cuenta...")
+                        account_info = get_account_summary(app)
 
-                    st.session_state.connection_status = True
-                    st.session_state.connection_info = {
-                        "connected": True,
-                        "accounts": app.accounts,
-                        "account_info": account_info,
-                        "net_liquidation": app.net_liquidation,
-                        "debug": debug + app.debug_messages
-                    }
+                        st.session_state.connection_status = True
+                        st.session_state.connection_info = {
+                            "connected": True,
+                            "accounts": app.accounts,
+                            "account_info": account_info,
+                            "net_liquidation": app.net_liquidation,
+                            "debug": debug + app.debug_messages,
+                            "mode": st.session_state.trading_mode,
+                            "platform": st.session_state.platform,
+                            "port": port
+                        }
 
-                    # Desconectar
-                    if app.isConnected():
-                        app.disconnect()
+                        # Desconectar
+                        if app.isConnected():
+                            app.disconnect()
 
         # Mostrar resultados
         if st.session_state.connection_info:
             info = st.session_state.connection_info
 
             if info.get("connected"):
-                st.success("✓ CONEXIÓN EXITOSA - Igual que test_ibapi.py")
+                conn_mode = info.get("mode", "paper")
+                conn_platform = info.get("platform", "TWS")
+                conn_port = info.get("port", port)
+
+                if conn_mode == "paper":
+                    st.success(f"✓ CONEXIÓN EXITOSA - {conn_platform} Paper (Puerto {conn_port})")
+                else:
+                    st.warning(f"⚠️ CONEXIÓN EXITOSA - {conn_platform} LIVE (Puerto {conn_port}) - DINERO REAL")
 
                 # Información de cuentas
                 st.subheader("👤 Cuentas")
@@ -1102,17 +1393,137 @@ def main():
         # Información de configuración
         with st.expander("ℹ️ Configuración actual"):
             st.json({
-                "Host": host,
+                "Host": st.session_state.host,
                 "Puerto": port,
-                "Client ID": client_id,
-                "Tipo": "Paper Trading" if port in [7497, 4002] else "Live Trading",
-                "Nota": "test_ibapi.py usa puerto 7496 y client_id 1"
+                "Client ID": st.session_state.client_id,
+                "Modo": "Paper Trading" if st.session_state.trading_mode == "paper" else "Live Trading",
+                "Plataforma": st.session_state.platform,
+                "Timeout": st.session_state.timeout
             })
 
     # =========================================================================
-    # TAB 4: Debug
+    # TAB 4: Configuración
     # =========================================================================
     with tab4:
+        st.subheader("⚙️ Configuración del Dashboard")
+
+        st.markdown("---")
+
+        # Sección de Modo de Trading
+        st.markdown("### 🎯 Modo de Trading")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.markdown("**Modo actual:**")
+            if st.session_state.trading_mode == "paper":
+                st.success("🟢 Paper Trading (Simulación)")
+                st.caption("Las operaciones NO afectan dinero real")
+            else:
+                st.error("🔴 Live Trading (Dinero Real)")
+                st.caption("⚠️ Las operaciones AFECTAN tu cuenta real")
+
+        with col2:
+            st.markdown("**Plataforma:**")
+            st.info(f"🖥️ {st.session_state.platform}")
+            st.caption(f"Puerto: {port}")
+
+        st.markdown("---")
+
+        # Configuración de conexión
+        st.markdown("### 🔌 Configuración de Conexión")
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            new_host = st.text_input(
+                "Host",
+                value=st.session_state.host,
+                key="config_host"
+            )
+
+        with col2:
+            new_client_id = st.number_input(
+                "Client ID",
+                value=st.session_state.client_id,
+                min_value=1,
+                max_value=999,
+                key="config_client_id"
+            )
+
+        with col3:
+            new_timeout = st.number_input(
+                "Timeout (segundos)",
+                value=st.session_state.timeout,
+                min_value=5,
+                max_value=60,
+                key="config_timeout"
+            )
+
+        st.markdown("---")
+
+        # Referencia de puertos
+        st.markdown("### 📡 Referencia de Puertos")
+
+        port_df = pd.DataFrame({
+            "Plataforma": ["TWS", "TWS", "Gateway", "Gateway"],
+            "Modo": ["Paper", "Live", "Paper", "Live"],
+            "Puerto": [7497, 7496, 4002, 4001],
+            "Descripción": [
+                "Simulación en TWS",
+                "Dinero real en TWS",
+                "Simulación en Gateway",
+                "Dinero real en Gateway"
+            ]
+        })
+
+        st.dataframe(port_df, use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+
+        # Botones de acción
+        col1, col2 = st.columns(2)
+
+        with col1:
+            if st.button("💾 Guardar Configuración", type="primary", use_container_width=True):
+                st.session_state.host = new_host
+                st.session_state.client_id = new_client_id
+                st.session_state.timeout = new_timeout
+                st.success("✓ Configuración guardada")
+                print(f"[CONFIG] Guardada: host={new_host}, client_id={new_client_id}, timeout={new_timeout}")
+
+        with col2:
+            if st.button("🔄 Restablecer Valores por Defecto", use_container_width=True):
+                st.session_state.host = DEFAULT_CONFIG["host"]
+                st.session_state.client_id = DEFAULT_CONFIG["client_id"]
+                st.session_state.timeout = DEFAULT_CONFIG["timeout"]
+                st.session_state.trading_mode = DEFAULT_CONFIG["mode"]
+                st.session_state.platform = DEFAULT_CONFIG["platform"]
+                st.session_state.live_confirmed = False
+                st.session_state.connection_status = False
+                st.success("✓ Valores restablecidos a defecto (Paper Trading)")
+                print("[CONFIG] Restablecido a valores por defecto")
+                st.rerun()
+
+        st.markdown("---")
+
+        # Resumen de configuración actual
+        with st.expander("📋 Ver configuración completa"):
+            st.json({
+                "trading_mode": st.session_state.trading_mode,
+                "platform": st.session_state.platform,
+                "host": st.session_state.host,
+                "port": port,
+                "client_id": st.session_state.client_id,
+                "timeout": st.session_state.timeout,
+                "live_confirmed": st.session_state.live_confirmed,
+                "connection_status": st.session_state.connection_status
+            })
+
+    # =========================================================================
+    # TAB 5: Debug
+    # =========================================================================
+    with tab5:
         st.subheader("🐛 Debug Log")
 
         if st.session_state.debug_log:
@@ -1131,6 +1542,10 @@ def main():
         st.subheader("📋 Estado de Session")
         st.json({
             "connection_status": st.session_state.connection_status,
+            "trading_mode": st.session_state.trading_mode,
+            "platform": st.session_state.platform,
+            "port": port,
+            "live_confirmed": st.session_state.live_confirmed,
             "last_symbol": st.session_state.last_symbol,
             "data_loaded": st.session_state.data is not None,
             "data_rows": len(st.session_state.data) if st.session_state.data is not None else 0
