@@ -1,0 +1,68 @@
+# ML Trading System Configuration
+
+# Global Settings
+data_storage_path: "data/history"
+models_storage_path: "data/models"
+random_seed: 42
+
+# Strategies Configuration
+strategies:
+  enhanced_sma:
+    enabled: true
+    timeframes: ["1d"]
+    symbols: ["SPY", "QQQ", "IWM"]
+    model_type: "random_forest"  # random_forest, xgboost, lightgbm
+    prediction_threshold: 0.65
+    
+  intraday_prediction:
+    enabled: true
+    timeframes: ["5mins", "15mins"]
+    symbols: ["SPY"]
+    model_type: "xgboost"
+    prediction_horizon: 1  # Predict next bar
+    confidence_threshold: 0.70
+
+# Feature Engineering
+features:
+  technical_indicators:
+    - name: "SMA"
+      params: [10, 20, 50, 200]
+    - name: "RSI"
+      params: [14]
+    - name: "MACD"
+      params: [12, 26, 9]
+    - name: "ATR"
+      params: [14]
+    - name: "BBANDS"
+      params: [20, 2]
+    - name: "ADX"
+      params: [14]
+  
+  derived_features:
+    - "momentum"
+    - "volatility"
+    - "volume_profile"
+
+# Training Configuration
+training:
+  train_test_split: 0.7
+  validation_split: 0.15
+  lookback_years: 2  # For daily models
+  lookback_days: 90  # For intraday models
+  retrain_schedule: "weekly"  # daily, weekly, monthly
+  
+# Hyperparameters (Defaults)
+models:
+  random_forest:
+    n_estimators: 100
+    max_depth: 10
+    min_samples_split: 2
+    n_jobs: -1
+    
+  xgboost:
+    n_estimators: 100
+    learning_rate: 0.1
+    max_depth: 6
+    subsample: 0.8
+    colsample_bytree: 0.8
+    n_jobs: -1
