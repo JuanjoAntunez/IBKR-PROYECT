@@ -19,10 +19,13 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-# Ensure project root is on sys.path so `src` imports work when running from dashboard/
+# Ensure project root is on sys.path before importing src modules
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.utils.logger import logger
+
 
 # Ensure an event loop exists for ib_insync/eventkit when running in Streamlit thread
 try:
@@ -30,7 +33,7 @@ try:
 except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
-from src.engine.frontend_adapter import get_adapter
+from src.engine.frontend_adapter import get_adapter, get_port_for_mode
 
 
 # =============================================================================
@@ -155,15 +158,8 @@ st.markdown("""
 
 
 # =============================================================================
-# Constantes y configuración de puertos
+# Configuración por defecto
 # =============================================================================
-PORT_MAP = {
-    ("TWS", "paper"): 7497,
-    ("TWS", "live"): 7496,
-    ("Gateway", "paper"): 4002,
-    ("Gateway", "live"): 4001,
-}
-
 DEFAULT_CONFIG = {
     "mode": "paper",
     "platform": "TWS",
@@ -173,15 +169,9 @@ DEFAULT_CONFIG = {
 }
 
 
-def get_port(platform, mode):
-    """Obtiene el puerto según plataforma y modo."""
-    return PORT_MAP.get((platform, mode), 7497)
-
-
 def log_mode_change(old_mode, new_mode, platform, port):
     """Log de cambio de modo para auditoría."""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] MODE CHANGE: {old_mode} → {new_mode} | Platform: {platform} | Port: {port}")
+    logger.info(f"MODE CHANGE: {old_mode} → {new_mode} | Platform: {platform} | Port: {port}")
 
 
 def _auto_refresh(interval_seconds: int, key: str):
@@ -192,10 +182,8 @@ def _auto_refresh(interval_seconds: int, key: str):
     if callable(refresh_fn):
         refresh_fn(interval=interval_seconds * 1000, key=key)
         return
-    # Fallback: sleep + rerun (blocks UI briefly)
-    time.sleep(interval_seconds)
-    if hasattr(st, "experimental_rerun"):
-        st.experimental_rerun()
+    # If autorefresh is not available, do nothing to avoid blocking UI.
+    return
 
 
 # =============================================================================
@@ -444,11 +432,15 @@ def main():
     if 'market_interval' not in st.session_state:
         st.session_state.market_interval = "1d"
     if 'auto_refresh_ticks' not in st.session_state:
-        st.session_state.auto_refresh_ticks = True
+        st.session_state.auto_refresh_ticks = bool(getattr(st, "autorefresh", None))
     if 'auto_refresh_interval' not in st.session_state:
         st.session_state.auto_refresh_interval = 5
     if 'tick_history' not in st.session_state:
         st.session_state.tick_history = {}
+    if 'subs_cache' not in st.session_state:
+        st.session_state.subs_cache = None
+    if 'subs_cache_ts' not in st.session_state:
+        st.session_state.subs_cache_ts = 0.0
 
     # =========================================================================
     # SIDEBAR
@@ -487,7 +479,7 @@ def main():
             st.session_state.connection_info = None
             st.session_state.trading_mode = selected_mode
             # Log del cambio
-            port = get_port(st.session_state.platform, selected_mode)
+            port = get_port_for_mode(st.session_state.platform, selected_mode)
             log_mode_change(old_mode, selected_mode, st.session_state.platform, port)
 
         # Warning y confirmación para Live
@@ -528,7 +520,7 @@ def main():
             st.session_state.connection_status = False
 
         # Calcular puerto automáticamente
-        port = get_port(st.session_state.platform, st.session_state.trading_mode)
+        port = get_port_for_mode(st.session_state.platform, st.session_state.trading_mode)
 
         # Mostrar puerto detectado
         mode_label = "Paper" if st.session_state.trading_mode == "paper" else "Live"
@@ -603,6 +595,47 @@ def main():
             ⚠️ MODO REAL ⚠️ - Live Trading - DINERO REAL
         </div>
         """, unsafe_allow_html=True)
+
+    # =========================================================================
+    # HEALTH BAR (header)
+    # =========================================================================
+    adapter = get_adapter()
+    engine_status = adapter.get_status()
+    connected = engine_status.get("connected")
+    ib_connected = engine_status.get("ib_connected")
+    hb = engine_status.get("heartbeat", {})
+    rc = engine_status.get("reconcile", {})
+    re = engine_status.get("reconnect", {})
+
+    hb_ok = bool(hb.get("last"))
+    rc_ok = bool(rc.get("last"))
+    re_attempts = re.get("attempts", 0)
+
+    st.markdown("""
+    <style>
+        .health-bar { display:flex; gap:10px; margin: 6px 0 12px 0; }
+        .health-pill { padding:6px 10px; border-radius:14px; font-size:12px; font-weight:600; }
+        .health-ok { background: rgba(0,200,83,0.2); color:#00c853; border:1px solid #00c853; }
+        .health-warn { background: rgba(255,193,7,0.2); color:#ffc107; border:1px solid #ffc107; }
+        .health-bad { background: rgba(255,23,68,0.2); color:#ff1744; border:1px solid #ff1744; }
+    </style>
+    """, unsafe_allow_html=True)
+
+    conn_class = "health-ok" if connected else "health-bad"
+    ib_class = "health-ok" if ib_connected else "health-bad"
+    hb_class = "health-ok" if hb_ok else "health-warn"
+    rc_class = "health-ok" if rc_ok else "health-warn"
+    re_class = "health-warn" if re_attempts else "health-ok"
+
+    st.markdown(f"""
+    <div class="health-bar">
+        <div class="health-pill {conn_class}">Connected: {connected}</div>
+        <div class="health-pill {ib_class}">IB: {ib_connected}</div>
+        <div class="health-pill {hb_class}">Heartbeat: {hb.get('last') or '—'}</div>
+        <div class="health-pill {rc_class}">Reconcile: {rc.get('last') or '—'}</div>
+        <div class="health-pill {re_class}">Reconnect attempts: {re_attempts}</div>
+    </div>
+    """, unsafe_allow_html=True)
 
     # =========================================================================
     # ÁREA PRINCIPAL
@@ -685,10 +718,18 @@ def main():
 
         st.markdown("---")
 
-        # Suscripciones activas (cache)
+        # Suscripciones activas (cache con TTL)
         adapter = get_adapter()
-        subs_ok, subs_err, subs = adapter.get_market_subscriptions(timeout=5)
-        subs = subs or {}
+        subs_ttl = 5.0
+        now = time.time()
+        subs_ok = True
+        subs_err = None
+        subs = st.session_state.subs_cache or {}
+        if now - st.session_state.subs_cache_ts >= subs_ttl or st.session_state.subs_cache is None:
+            subs_ok, subs_err, subs = adapter.get_market_subscriptions(timeout=5)
+            subs = subs or {}
+            st.session_state.subs_cache = subs
+            st.session_state.subs_cache_ts = now
         if subs_ok and subs:
             st.caption(f"📡 Suscripciones activas: {', '.join(sorted(subs.keys()))}")
         elif subs_ok:
@@ -1177,29 +1218,94 @@ def main():
     with tab3:
         st.subheader("🔧 Test de Conexión con IB")
 
-        # Mostrar modo actual
+        # Mostrar modo actual + configuración efectiva
         mode_text = "Paper (Simulación)" if st.session_state.trading_mode == "paper" else "Live (Dinero Real)"
         mode_color = "green" if st.session_state.trading_mode == "paper" else "red"
         st.markdown(f"**Modo actual:** :{mode_color}[{mode_text}]")
         st.markdown(f"**Plataforma:** {st.session_state.platform} | **Puerto:** {port}")
 
+        resolved_cfg = None
+        try:
+            resolved_cfg = adapter.resolve_connection(
+                mode=st.session_state.trading_mode,
+                host=st.session_state.host,
+                port=port,
+                client_id=st.session_state.client_id,
+            )
+        except Exception:
+            resolved_cfg = None
+
+        if resolved_cfg:
+            st.caption(
+                f"Config efectiva → Host: {resolved_cfg.get('host')} | "
+                f"Puerto: {resolved_cfg.get('port')} | Client ID: {resolved_cfg.get('client_id')}"
+            )
+
+        # Mostrar estado del engine en tiempo real
+        adapter = get_adapter()
+        engine_status = adapter.get_status()
+
+        col_status1, col_status2, col_status3 = st.columns(3)
+        with col_status1:
+            engine_running = engine_status.get("running", False)
+            st.metric("Engine Running", "✅ Sí" if engine_running else "❌ No")
+        with col_status2:
+            engine_connected = engine_status.get("connected", False)
+            st.metric("Engine Connected", "✅ Sí" if engine_connected else "❌ No")
+        with col_status3:
+            ib_connected = engine_status.get("ib_connected", False)
+            st.metric("IB Connected", "✅ Sí" if ib_connected else "❌ No")
+
+        st.markdown("---")
+
         connect_btn = st.button(
             "🔌 Test Conexión",
             use_container_width=True,
-            type="secondary",
+            type="primary",
+            key="btn_test_connection",
             disabled=not can_connect,
         )
 
         if connect_btn:
+            st.toast("Iniciando test de conexión...", icon="🔌")
             if st.session_state.trading_mode == "live" and not st.session_state.live_confirmed:
                 st.error("⛔ Debes confirmar el modo Live antes de conectar")
             else:
-                with st.spinner(f"🔄 Conectando a {st.session_state.platform} ({mode_text})..."):
+                progress_container = st.empty()
+                status_container = st.empty()
+
+                # Paso 1: Iniciar engine
+                progress_container.info("🔄 Paso 1/4: Iniciando Trading Engine...")
+                adapter = get_adapter()
+                adapter.ensure_running()
+
+                # Verificar que engine está corriendo
+                engine_status = adapter.get_status()
+                if not engine_status.get("running"):
+                    st.error("❌ No se pudo iniciar el Trading Engine")
+                    st.session_state.connection_info = {"error": "Engine failed to start", "debug": []}
+                else:
+                    status_container.success("✅ Engine iniciado")
+
+                    # Paso 2: Conectar a IB
+                    progress_container.info(f"🔄 Paso 2/4: Conectando a {st.session_state.platform} ({mode_text})...")
+                    if resolved_cfg:
+                        logger.info(
+                            "Intentando conectar a "
+                            f"{resolved_cfg.get('host')}:{resolved_cfg.get('port')} "
+                            f"con client_id={resolved_cfg.get('client_id')}"
+                        )
+                    else:
+                        logger.info(
+                            f"Intentando conectar a {st.session_state.host}:{port} "
+                            f"con client_id={st.session_state.client_id}"
+                        )
+
                     success, error, info, debug = connect_to_ib(
-                        st.session_state.host,
-                        port,
-                        st.session_state.client_id,
-                        timeout=st.session_state.timeout,
+                        (resolved_cfg or {}).get("host", st.session_state.host),
+                        (resolved_cfg or {}).get("port", port),
+                        (resolved_cfg or {}).get("client_id", st.session_state.client_id),
+                        timeout=st.session_state.timeout + 5,  # Extra timeout for connection
                         mode=st.session_state.trading_mode,
                         confirm_live=st.session_state.live_confirmed,
                     )
@@ -1207,20 +1313,34 @@ def main():
                     st.session_state.debug_log = debug
 
                     if error or not success:
+                        progress_container.error(f"❌ Error de conexión: {error or 'Unknown error'}")
                         st.session_state.connection_status = False
                         st.session_state.connection_info = {"error": error or "Connection failed", "debug": debug}
                     else:
-                        # Solicitar info de cuenta desde el engine
-                        st.write("Solicitando resumen de cuenta...")
-                        adapter = get_adapter()
+                        status_container.success("✅ Conectado a IB")
+
+                        # Paso 3: Obtener info de cuenta
+                        progress_container.info("🔄 Paso 3/4: Obteniendo información de cuenta...")
                         acc_ok, acc_err, summary = adapter.get_account(timeout=st.session_state.timeout)
 
                         if not acc_ok:
-                            st.session_state.connection_status = False
-                            st.session_state.connection_info = {"error": acc_err or "Account fetch failed", "debug": debug}
+                            progress_container.warning(f"⚠️ No se pudo obtener cuenta: {acc_err}")
+                            st.session_state.connection_status = True  # Still connected, just no account info
+                            st.session_state.connection_info = {
+                                "connected": True,
+                                "accounts": info.get("accounts", []) if isinstance(info, dict) else [],
+                                "account_info": {},
+                                "debug": debug,
+                                "mode": st.session_state.trading_mode,
+                                "platform": st.session_state.platform,
+                                "port": port,
+                                "warning": acc_err,
+                            }
                         else:
                             account_info = _build_account_data(summary)
 
+                            # Paso 4: Completado
+                            progress_container.success("✅ Paso 4/4: Conexión completada exitosamente!")
                             st.session_state.connection_status = True
                             accounts = info.get("accounts", []) if isinstance(info, dict) else []
                             st.session_state.connection_info = {
@@ -1233,6 +1353,8 @@ def main():
                                 "platform": st.session_state.platform,
                                 "port": port,
                             }
+
+                        st.rerun()  # Refresh to show updated status
 
         # Mostrar resultados
         if st.session_state.connection_info:
@@ -1319,6 +1441,18 @@ def main():
                 "Plataforma": st.session_state.platform,
                 "Timeout": st.session_state.timeout
             })
+            # Mostrar configuración efectiva (resuelta por engine/config/env)
+            try:
+                resolved = adapter.resolve_connection(
+                    mode=st.session_state.trading_mode,
+                    host=st.session_state.host,
+                    port=port,
+                    client_id=st.session_state.client_id,
+                )
+                st.caption("Configuración efectiva (engine/config/env)")
+                st.json(resolved)
+            except Exception:
+                pass
 
     # =========================================================================
     # TAB 4: Configuración
@@ -1409,7 +1543,7 @@ def main():
                 st.session_state.client_id = new_client_id
                 st.session_state.timeout = new_timeout
                 st.success("✓ Configuración guardada")
-                print(f"[CONFIG] Guardada: host={new_host}, client_id={new_client_id}, timeout={new_timeout}")
+                logger.info(f"[CONFIG] Guardada: host={new_host}, client_id={new_client_id}, timeout={new_timeout}")
 
         with col2:
             if st.button("🔄 Restablecer Valores por Defecto", use_container_width=True):
@@ -1421,7 +1555,7 @@ def main():
                 st.session_state.live_confirmed = False
                 st.session_state.connection_status = False
                 st.success("✓ Valores restablecidos a defecto (Paper Trading)")
-                print("[CONFIG] Restablecido a valores por defecto")
+                logger.info("[CONFIG] Restablecido a valores por defecto")
                 st.rerun()
 
         st.markdown("---")

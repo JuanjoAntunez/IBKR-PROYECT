@@ -11,6 +11,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, Dict, Tuple, List
 from threading import RLock
+from pathlib import Path
+import json
+import os
 
 from ib_insync import Trade, IB
 
@@ -37,6 +40,10 @@ class OrderManager:
         self._lock = RLock()
         self._client_key_index: Dict[str, int] = {}
         self._records: Dict[int, OrderRecord] = {}
+        self._idempotency_file = Path(
+            os.getenv("IB_IDEMPOTENCY_FILE", "data/idempotency.jsonl")
+        )
+        self._load_idempotency()
 
     # ---------------------------------------------------------------------
     # Idempotency
@@ -63,6 +70,39 @@ class OrderManager:
                 order_id=order_id,
                 client_order_key=client_order_key,
             )
+            self._persist_idempotency(client_order_key, order_id)
+
+    def _load_idempotency(self) -> None:
+        """Load idempotency keys from file (best effort)."""
+        try:
+            if not self._idempotency_file.exists():
+                return
+            with self._idempotency_file.open("r") as f:
+                for line in f:
+                    try:
+                        item = json.loads(line.strip())
+                        key = item.get("client_order_key")
+                        order_id = item.get("order_id")
+                        if key and isinstance(order_id, int):
+                            self._client_key_index[key] = order_id
+                    except Exception:
+                        continue
+        except Exception:
+            return
+
+    def _persist_idempotency(self, client_order_key: str, order_id: int) -> None:
+        """Persist idempotency mapping to file (append-only)."""
+        try:
+            self._idempotency_file.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "client_order_key": client_order_key,
+                "order_id": order_id,
+                "ts": datetime.now().isoformat(),
+            }
+            with self._idempotency_file.open("a") as f:
+                f.write(json.dumps(payload) + "\n")
+        except Exception:
+            return
 
     # ---------------------------------------------------------------------
     # Order ID allocation
@@ -110,6 +150,7 @@ class OrderManager:
             "PendingCancel": OrderStatus.PENDING,
             "PreSubmitted": OrderStatus.SUBMITTED,
             "Submitted": OrderStatus.SUBMITTED,
+            "PartiallyFilled": OrderStatus.PARTIALLY_FILLED,
             "Filled": OrderStatus.FILLED,
             "Cancelled": OrderStatus.CANCELLED,
             "ApiCancelled": OrderStatus.CANCELLED,
@@ -123,6 +164,31 @@ class OrderManager:
             status=new_status,
             filled_quantity=int(trade.orderStatus.filled),
             avg_fill_price=trade.orderStatus.avgFillPrice,
+        )
+
+    def handle_execution(self, fill) -> None:
+        """Update order state based on execution fill."""
+        try:
+            order_id = int(fill.execution.orderId)
+        except Exception:
+            return
+
+        order = self._state.get_order(order_id)
+        if not order:
+            return
+
+        filled = int(fill.execution.cumQty or fill.execution.shares or 0)
+        avg_price = float(fill.execution.avgPrice or fill.execution.price or 0.0)
+
+        if filled <= 0:
+            return
+
+        status = OrderStatus.PARTIALLY_FILLED if filled < order.quantity else OrderStatus.FILLED
+        self._state.update_order(
+            order_id,
+            status=status,
+            filled_quantity=filled,
+            avg_fill_price=avg_price,
         )
 
     def reconcile_open_orders(self, ib: IB) -> Dict[int, str]:

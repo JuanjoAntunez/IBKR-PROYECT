@@ -13,12 +13,13 @@ This prevents accidental live trading activation.
 
 import os
 import hashlib
-import getpass
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 from datetime import datetime
 from dataclasses import dataclass
+
+from src.utils.logger import logger
 
 
 class TradingMode(Enum):
@@ -73,7 +74,8 @@ class TradingModeManager:
         timestamp = datetime.now().isoformat()
         entry = f"[{timestamp}] [{level}] {message}"
         self._log_entries.append(entry)
-        print(f"[MODE] {message}")
+        log_func = getattr(logger, level.lower(), logger.info)
+        log_func(f"[MODE] {message}")
 
     @property
     def mode(self) -> TradingMode:

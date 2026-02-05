@@ -20,7 +20,7 @@ responsable de conectar a IB, enviar órdenes y reconciliar estado. Los frontend
 (Streamlit y FastAPI) solo envían comandos al engine.
 
 Notas:
-- El stack antiguo está aislado en `src/legacy` y no forma parte del flujo actual.
+- El stack antiguo fue eliminado; todo el flujo pasa por `src/engine`.
 - El ejemplo principal (`main.py`) ya usa el engine para evitar accesos directos a IB.
 
 ## 📋 Requisitos Previos

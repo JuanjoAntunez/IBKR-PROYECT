@@ -12,6 +12,8 @@ from threading import RLock
 from copy import deepcopy
 import pandas as pd
 
+from src.utils.logger import logger
+
 
 class ConnectionStatus(Enum):
     """Connection status with IB."""
@@ -336,7 +338,7 @@ class EngineState:
         self._messages.append(full_message)
         if len(self._messages) > self._max_messages:
             self._messages = self._messages[-self._max_messages:]
-        print(f"[ENGINE] {message}")
+        logger.debug(f"[ENGINE] {message}")
 
     def add_message(self, message: str):
         with self._lock:

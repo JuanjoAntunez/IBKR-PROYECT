@@ -30,6 +30,8 @@ logs/*.log
 
 # Credentials (NEVER commit)
 config/credentials.py
+config/credentials_paper.py
+config/credentials_live.py
 config/credentials/
 config/live.yaml
 
@@ -41,6 +43,7 @@ config/live.yaml
 
 # Audit logs (sensitive data)
 logs/audit_trades.jsonl
+data/idempotency.jsonl
 
 # OS
 .DS_Store

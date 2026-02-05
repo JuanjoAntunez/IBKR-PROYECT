@@ -81,17 +81,19 @@ pip install pandas-ta
 ### 4️⃣ Configurar credenciales
 
 ```bash
-# Copiar plantilla de credenciales
+# Opción A (simple): un solo archivo para todos los modos
 cp config/credentials.py.example config/credentials.py
-
-# Editar con tus datos (usa VS Code, nano, vim...)
 code config/credentials.py
 
-# Contenido a modificar:
-# IB_ACCOUNT_ID = "DU1234567"  # Tu account ID de IB Paper
-# CLIENT_ID = 1
-# ACCOUNT_TYPE = "PAPER"
+# Opción B (recomendado): separar paper/live
+cp config/credentials_paper.py.example config/credentials_paper.py
+cp config/credentials_live.py.example config/credentials_live.py
+code config/credentials_paper.py
+code config/credentials_live.py
 ```
+
+El engine usará automáticamente `credentials_paper.py` o `credentials_live.py`
+según el modo, con fallback a `credentials.py` si no existen.
 
 ### 5️⃣ Configurar TWS/Gateway
 
@@ -177,7 +179,7 @@ Claude Code leerá automáticamente `CLAUDE.md` y entenderá:
 - [ ] Dependencias instaladas (`pip list`)
 - [ ] Carpetas creadas (`config/`, `src/`, `tests/`, `logs/`)
 - [ ] Archivos copiados y renombrados correctamente
-- [ ] `config/credentials.py` configurado
+- [ ] `config/credentials_paper.py` / `config/credentials_live.py` (o `credentials.py`) configurado
 - [ ] TWS/Gateway corriendo
 - [ ] API habilitada en TWS
 - [ ] `python main.py` funciona sin errores

@@ -1,3 +1,5 @@
+import pytest
+
 from src.engine.order_manager import OrderManager
 from src.engine.state import EngineState, OrderStatus
 from src.engine.commands import PlaceOrderCommand, OrderAction, OrderType
@@ -35,6 +37,11 @@ class DummyIB:
 
     def openTrades(self):
         return self._trades
+
+
+@pytest.fixture(autouse=True)
+def _idempotency_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("IB_IDEMPOTENCY_FILE", str(tmp_path / "idempotency.jsonl"))
 
 
 def test_idempotency_resolve():
@@ -77,6 +84,30 @@ def test_order_status_mapping():
     assert updated.status == OrderStatus.FILLED
     assert updated.filled_quantity == 1
     assert updated.avg_fill_price == 123.45
+
+
+def test_order_status_partial_and_reject():
+    state = EngineState()
+    om = OrderManager(state)
+
+    cmd = PlaceOrderCommand(
+        symbol="AAPL",
+        action=OrderAction.BUY,
+        quantity=10,
+        order_type=OrderType.MARKET,
+    )
+    om.add_created_order(cmd, order_id=201)
+
+    trade_partial = DummyTrade(order_id=201, status="PartiallyFilled", filled=4, avg_fill=120.0)
+    om.handle_order_status(trade_partial)
+    updated = state.get_order(201)
+    assert updated.status == OrderStatus.PARTIALLY_FILLED
+    assert updated.filled_quantity == 4
+
+    trade_reject = DummyTrade(order_id=201, status="Inactive", filled=0, avg_fill=0.0)
+    om.handle_order_status(trade_reject)
+    updated = state.get_order(201)
+    assert updated.status == OrderStatus.REJECTED
 
 
 def test_reconcile_adds_unknown_orders():

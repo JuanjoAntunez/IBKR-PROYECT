@@ -9,13 +9,13 @@ In paper mode, violations generate warnings but orders proceed.
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Callable
 from enum import Enum
 import threading
 from collections import deque
-import json
 
 from .trading_mode import TradingMode, is_live_mode
+from src.utils.logger import logger
 
 
 class LimitType(Enum):
@@ -139,6 +139,7 @@ class OrderRequest:
     order_type: str
     limit_price: Optional[float] = None
     estimated_value: Optional[float] = None
+    account_id: Optional[str] = None
     timestamp: datetime = field(default_factory=datetime.now)
 
 
@@ -208,15 +209,15 @@ class Guardrails:
         self._max_violations_stored = 1000
 
         # Callbacks
-        self._on_kill_switch: Optional[callable] = None
-        self._on_violation: Optional[callable] = None
+        self._on_kill_switch: Optional[Callable[[str], None]] = None
+        self._on_violation: Optional[Callable[[Any], None]] = None
 
         self._log(f"Guardrails initialized in {mode.value} mode")
 
     def _log(self, message: str, level: str = "INFO"):
         """Internal logging."""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        print(f"[GUARDRAILS][{level}] {message}")
+        log_func = getattr(logger, level.lower(), logger.info)
+        log_func(f"[GUARDRAILS] {message}")
 
     @property
     def limits(self) -> TradingLimits:

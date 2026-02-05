@@ -35,6 +35,7 @@ from .commands import (
     OrderType,
 )
 from .state import EngineState, ConnectionStatus
+from .config_loader import resolve_connection_params
 
 
 class EngineAdapter:
@@ -318,6 +319,26 @@ class EngineAdapter:
     def get_status(self) -> dict:
         """Get engine status."""
         return self._engine.get_status()
+
+    def resolve_connection(
+        self,
+        mode: str,
+        host: str,
+        port: int,
+        client_id: int,
+    ) -> dict:
+        """Resolve effective connection params (config + env + overrides)."""
+        resolved_host, resolved_port, resolved_client_id, _cfg, _creds = resolve_connection_params(
+            mode=mode,
+            host=host,
+            port=port,
+            client_id=client_id,
+        )
+        return {
+            "host": resolved_host,
+            "port": resolved_port,
+            "client_id": resolved_client_id,
+        }
 
     # =========================================================================
     # Internal Methods

@@ -20,6 +20,7 @@ except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
 from ib_insync import IB, Stock, Order, LimitOrder, MarketOrder, StopOrder, util, Trade
+import ib_insync
 
 from .commands import (
     Command,
@@ -53,6 +54,7 @@ from .trading_mode import TradingMode, get_mode_manager
 from .audit_log import get_audit_log
 from .order_manager import OrderManager
 from .market_data import MarketDataService
+from .config_loader import resolve_connection_params, load_credentials
 
 
 class TradingEngine:
@@ -223,10 +225,19 @@ class TradingEngine:
     def _engine_loop(self):
         """Main engine loop - processes commands from queue."""
         self.state.add_message("Engine loop started")
+
+        # Avoid patching asyncio by default; nest_asyncio can break on newer
+        # Python versions (e.g., 3.14) during IB connect timeouts.
+        if os.getenv("IB_PATCH_ASYNCIO", "0") == "1":
+            util.patchAsyncio()
+            self.state.add_message("Asyncio patched via IB_PATCH_ASYNCIO=1")
+
+        # Now create/get the event loop for this thread
         try:
-            asyncio.get_event_loop()
+            loop = asyncio.get_event_loop()
         except RuntimeError:
-            asyncio.set_event_loop(asyncio.new_event_loop())
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
 
         while self._running:
             try:
@@ -252,6 +263,13 @@ class TradingEngine:
     def _tick(self):
         """Periodic engine maintenance tasks."""
         now = time.time()
+
+        # Process ib_insync events (required for callbacks to work)
+        if self._ib:
+            try:
+                self._ib.sleep(0.01)  # Small sleep to process pending events
+            except Exception:
+                pass
 
         # Heartbeat + reconcile when connected
         if self.state.is_connected and self._ib and self._ib.isConnected():
@@ -399,11 +417,12 @@ class TradingEngine:
             return CommandResult(success=True, data="Already connected")
 
         try:
-            # Mode-specific connection overrides (paper/live separation)
-            mode_key = "LIVE" if cmd.mode.lower() == "live" else "PAPER"
-            host = os.getenv(f"IB_{mode_key}_HOST", cmd.host)
-            port = int(os.getenv(f"IB_{mode_key}_PORT", cmd.port))
-            client_id = int(os.getenv(f"IB_{mode_key}_CLIENT_ID", cmd.client_id))
+            host, port, client_id, config, creds = resolve_connection_params(
+                mode=cmd.mode,
+                host=cmd.host,
+                port=cmd.port,
+                client_id=cmd.client_id,
+            )
 
             requested_mode = TradingMode.LIVE if cmd.mode.lower() == "live" else TradingMode.PAPER
             validation = self._mode_manager.validate_mode(requested_mode)
@@ -417,7 +436,33 @@ class TradingEngine:
             self.state.set_connection_status(ConnectionStatus.CONNECTING)
 
             self._ib = IB()
-            self._ib.connect(host, port, clientId=client_id, readonly=False)
+
+            # Log connection attempt
+            self.state.add_message(
+                f"Connecting to IB at {host}:{port} (client {client_id}, mode {cmd.mode})..."
+            )
+
+            try:
+                self._ib.connect(host, port, clientId=client_id, readonly=False)
+            except Exception as conn_err:
+                self.state.add_message(f"Connection error: {conn_err}")
+                raise
+
+            # Give connection time to establish without blocking engine loop
+            if self._ib:
+                self._ib.sleep(1)
+
+            max_wait = 5.0
+            start = time.time()
+            while time.time() - start < max_wait:
+                if self._ib.isConnected():
+                    self.state.add_message("IB connection confirmed")
+                    break
+                if self._ib:
+                    self._ib.sleep(0.2)  # Poll interval
+            else:
+                self.state.add_message("Connection timeout - not confirmed")
+
             self._market_data.set_ib(self._ib)
 
             if not self._ib.isConnected():
@@ -440,14 +485,24 @@ class TradingEngine:
                 platform=platform,
                 accounts=accounts,
             )
+            if creds.get("IB_ACCOUNT_ID"):
+                self.state.update_account_summary(account_id=str(creds["IB_ACCOUNT_ID"]))
 
-            # Initialize guardrails based on mode
-            if requested_mode == TradingMode.LIVE:
-                limits = TradingLimits.live_strict_limits()
+            # Initialize guardrails based on mode (config overrides)
+            limits_cfg = (config or {}).get("limits") if isinstance(config, dict) else None
+            if limits_cfg:
+                limits = TradingLimits.from_dict(limits_cfg)
             else:
-                limits = TradingLimits.paper_limits()
+                if requested_mode == TradingMode.LIVE:
+                    limits = TradingLimits.live_strict_limits()
+                else:
+                    limits = TradingLimits.paper_limits()
 
             self._guardrails = Guardrails(mode=requested_mode, limits=limits)
+            # Apply account id if provided in credentials
+            account_id = creds.get("IB_ACCOUNT_ID")
+            if account_id:
+                self.state.update_account_summary(account_id=account_id)
             self._auto_reconnect = self._auto_reconnect_config
             self._reconnect_attempts = 0
             self._next_reconnect_time = None
@@ -564,6 +619,7 @@ class TradingEngine:
             return CommandResult(success=False, error="Not connected")
 
         try:
+            creds = load_credentials(self.state.get_connection_info().get("mode", "paper"))
             values = self._ib.accountValues()
 
             tag_mapping = {
@@ -592,6 +648,8 @@ class TradingEngine:
                     currency = av.currency or currency
 
             self.state.update_account_summary(account_id=account_id, currency=currency)
+            if not account_id and creds.get("IB_ACCOUNT_ID"):
+                self.state.update_account_summary(account_id=str(creds["IB_ACCOUNT_ID"]))
 
             summary = self.state.get_account_summary()
             if self._guardrails:
@@ -721,6 +779,12 @@ class TradingEngine:
         except Exception:
             pass
         try:
+            fills = self._ib.reqExecutions()
+            for fill in fills:
+                self._order_manager.handle_execution(fill)
+        except Exception:
+            pass
+        try:
             self._execute_get_positions(GetPositionsCommand())
         except Exception:
             pass
@@ -779,7 +843,20 @@ class TradingEngine:
             self.state.set_connection_status(ConnectionStatus.CONNECTING)
             self._ib = IB()
             self._ib.connect(host, port, clientId=client_id, readonly=False)
+
+            # Wait for connection without blocking engine loop
+            if self._ib:
+                self._ib.sleep(1)
+            max_wait = 5.0
+            start = time.time()
+            while time.time() - start < max_wait:
+                if self._ib.isConnected():
+                    break
+                if self._ib:
+                    self._ib.sleep(0.2)
+
             self._market_data.set_ib(self._ib)
+
             if not self._ib.isConnected():
                 self._handle_disconnect("Reconnect failed")
                 return
@@ -873,6 +950,7 @@ class TradingEngine:
                 order_type=cmd.order_type.value,
                 limit_price=cmd.limit_price,
                 estimated_value=(cmd.limit_price * cmd.quantity) if cmd.limit_price else None,
+                account_id=self.state.get_account_summary().account_id,
             )
 
             if self._guardrails:
