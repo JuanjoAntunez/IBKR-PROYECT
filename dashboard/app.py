@@ -237,10 +237,20 @@ def fetch_portfolio(host, port, client_id, mode="paper", confirm_live=False, tim
     """
     adapter = get_adapter()
 
+    try:
+        resolved = adapter.resolve_connection(
+            mode=mode,
+            host=host,
+            port=port,
+            client_id=client_id,
+        )
+    except Exception:
+        resolved = {"host": host, "port": port, "client_id": client_id}
+
     success, error, _, debug = connect_to_ib(
-        host=host,
-        port=port,
-        client_id=client_id,
+        host=resolved.get("host", host),
+        port=resolved.get("port", port),
+        client_id=resolved.get("client_id", client_id),
         mode=mode,
         confirm_live=confirm_live,
         timeout=timeout,

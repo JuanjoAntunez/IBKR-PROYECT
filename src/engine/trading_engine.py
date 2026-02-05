@@ -92,6 +92,11 @@ class TradingEngine:
         self._heartbeat_interval = int(os.getenv("IB_HEARTBEAT_INTERVAL", "10"))
         self._last_reconcile_time = 0.0
         self._last_heartbeat_time = 0.0
+        # Throttle account/positions fetches to avoid IB pacing limits
+        self._account_min_interval = float(os.getenv("IB_ACCOUNT_MIN_INTERVAL", "5"))
+        self._positions_min_interval = float(os.getenv("IB_POSITIONS_MIN_INTERVAL", "5"))
+        self._last_account_fetch_time = 0.0
+        self._last_positions_fetch_time = 0.0
         self._auto_reconnect_config = os.getenv("IB_AUTO_RECONNECT", "1") != "0"
         self._auto_reconnect = self._auto_reconnect_config
         self._reconnect_attempts = 0
@@ -619,7 +624,17 @@ class TradingEngine:
             return CommandResult(success=False, error="Not connected")
 
         try:
-            creds = load_credentials(self.state.get_connection_info().get("mode", "paper"))
+            now = time.time()
+            if (
+                self._last_account_fetch_time > 0
+                and now - self._last_account_fetch_time < self._account_min_interval
+            ):
+                return CommandResult(success=True, data=self.state.get_account_summary())
+
+            try:
+                creds = load_credentials(self.state.get_connection_info().get("mode", "paper"))
+            except Exception:
+                creds = {}
             values = self._ib.accountValues()
 
             tag_mapping = {
@@ -659,6 +674,7 @@ class TradingEngine:
                 daily_pnl = summary.realized_pnl + summary.unrealized_pnl
                 self._guardrails.update_daily_pnl(daily_pnl)
 
+            self._last_account_fetch_time = time.time()
             return CommandResult(success=True, data=summary)
 
         except Exception as e:
@@ -670,6 +686,13 @@ class TradingEngine:
             return CommandResult(success=False, error="Not connected")
 
         try:
+            now = time.time()
+            if (
+                self._last_positions_fetch_time > 0
+                and now - self._last_positions_fetch_time < self._positions_min_interval
+            ):
+                return CommandResult(success=True, data=self.state.get_positions())
+
             self.state.clear_positions()
             positions = self._ib.positions()
 
@@ -698,6 +721,7 @@ class TradingEngine:
             if self._guardrails:
                 self._guardrails.update_portfolio_exposure(total_exposure)
 
+            self._last_positions_fetch_time = time.time()
             return CommandResult(success=True, data=self.state.get_positions())
 
         except Exception as e:

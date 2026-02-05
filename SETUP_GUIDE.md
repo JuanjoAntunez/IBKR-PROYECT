@@ -131,8 +131,8 @@ TotalCashValue: 1000000.00 USD
 # Tests que no requieren conexión
 pytest tests/test_connection.py -v
 
-# Para ejecutar tests que SÍ requieren TWS activo:
-# Editar tests/test_connection.py y cambiar skipif(True) a skipif(False)
+# Para ejecutar tests E2E que requieren TWS/Gateway activo:
+IB_E2E_PAPER=1 pytest -k e2e_paper -q
 ```
 
 ---
