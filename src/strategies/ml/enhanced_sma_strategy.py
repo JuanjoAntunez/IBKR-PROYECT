@@ -22,17 +22,19 @@ class EnhancedSMAStrategy(BaseStrategy):
         self.fast_period = fast_period
         self.slow_period = slow_period
         self.threshold = threshold
-        self.model_key = f"enhanced_sma_{self.config.symbols[0]}" # Assume single symbol for now or map
+
+    def _model_key(self, symbol: str) -> str:
+        return f"enhanced_sma_{symbol}"
         
     def calculate_signals(self, data: pd.DataFrame) -> List[Signal]:
         signals: List[Signal] = []
         if data.empty:
             return signals
             
-        symbol = data['symbol'].iloc[0] if 'symbol' in data.columns else self.symbols[0]
+        symbol = data["symbol"].iloc[0] if "symbol" in data.columns else self.symbols[0]
         
         # 1. Calculate SMA
-        close = data['close']
+        close = data["close"]
         if len(close) < self.slow_period:
             return signals
             
@@ -48,7 +50,7 @@ class EnhancedSMAStrategy(BaseStrategy):
         if golden_cross:
             # Check ML
             # We pass the WHOLE dataframe to ML Engine, it handles feature generation
-            pred = self.ml_engine.get_prediction(self.model_key, data)
+            pred = self.ml_engine.get_prediction(self._model_key(symbol), data)
             
             if "error" in pred:
                 logger.warning(f"ML Error: {pred['error']}")
@@ -73,14 +75,14 @@ class EnhancedSMAStrategy(BaseStrategy):
                 
         elif death_cross:
             # Exit long
-             signal = Signal(
+            signal = Signal(
                 symbol=symbol,
                 signal_type=SignalType.CLOSE_LONG,
                 timestamp=datetime.now(),
                 price=close.iloc[-1],
                 metadata={"reason": "death_cross"}
             )
-             signals.append(signal)
+            signals.append(signal)
              
         # Manage Exits via ML confidence? 
         # User said: "Take profit basado en ML confidence"
@@ -89,7 +91,7 @@ class EnhancedSMAStrategy(BaseStrategy):
             pos = self.get_position(symbol)
             if pos.side == PositionSide.LONG:
                 # Check current ML confidence
-                pred = self.ml_engine.get_prediction(self.model_key, data)
+                pred = self.ml_engine.get_prediction(self._model_key(symbol), data)
                 prob = pred.get("probability", 0.5)
                 if prob < 0.4: # Exit if confidence drops
                      signal = Signal(

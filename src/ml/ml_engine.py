@@ -75,6 +75,7 @@ class MLEngine:
         model_data = self.models[model_key]
         raw_model = model_data['model']
         required_features = model_data.get('features_used', [])
+        scaler = model_data.get('scaler')
         
         # 1. Generate Features
         # We process the whole dataframe, then take the last row
@@ -99,6 +100,19 @@ class MLEngine:
         except KeyError as e:
             logger.error(f"Missing features: {e}")
             return {"error": f"Missing features: {e}"}
+
+        # 1b. Apply scaler if available
+        if scaler is not None:
+            try:
+                scaled = scaler.transform(input_vector)
+                input_vector = pd.DataFrame(
+                    scaled,
+                    index=input_vector.index,
+                    columns=input_vector.columns,
+                )
+            except Exception as e:
+                logger.error(f"Scaling failed: {e}")
+                return {"error": f"Scaling failed: {e}"}
             
         # 2. Predict
         try:

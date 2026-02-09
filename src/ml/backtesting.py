@@ -1,5 +1,5 @@
 import pandas as pd
-from typing import Dict, Type
+from typing import Dict, Type, Optional, Callable
 from .data_pipeline import MLDataPipeline
 from src.strategies.base import BaseStrategy, StrategyConfig
 from loguru import logger
@@ -13,12 +13,29 @@ class MLBacktester:
     def __init__(self, pipeline: MLDataPipeline):
         self.pipeline = pipeline
         
-    def run(self, strategy_class: Type[BaseStrategy], config: StrategyConfig, symbol: str, start_date: str, end_date: str, ml_engine):
+    def run(
+        self,
+        strategy_class: Type[BaseStrategy],
+        config: StrategyConfig,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        ml_engine,
+        fetch_func: Optional[Callable] = None,
+        force_refresh: bool = False,
+    ):
         
         logger.info(f"Starting backtest for {symbol} from {start_date} to {end_date}")
         
         # 1. Load Data
-        df = self.pipeline.get_data(symbol, "1d", start_date=pd.to_datetime(start_date), end_date=pd.to_datetime(end_date))
+        df = self.pipeline.get_data(
+            symbol,
+            "1d",
+            start_date=pd.to_datetime(start_date),
+            end_date=pd.to_datetime(end_date),
+            fetch_func=fetch_func,
+            force_refresh=force_refresh,
+        )
         
         # 2. Initialize Strategy
         # Strategy expects MLEngine

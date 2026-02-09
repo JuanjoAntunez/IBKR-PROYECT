@@ -16,6 +16,7 @@ class BaseModel(ABC):
         self.model_name = model_name
         self.model = None
         self.features_used = []
+        self.scaler = None
         
     @abstractmethod
     def train(self, X_train: pd.DataFrame, y_train: Union[pd.Series, np.ndarray], **kwargs) -> Dict:
@@ -48,7 +49,8 @@ class BaseModel(ABC):
             'model': self.model,
             'config': self.config,
             'features_used': self.features_used,
-            'model_name': self.model_name
+            'model_name': self.model_name,
+            'scaler': self.scaler,
         }
         joblib.dump(data, path)
         logger.info(f"Model saved to {path}")
@@ -65,6 +67,7 @@ class BaseModel(ABC):
         self.config = data['config']
         self.features_used = data['features_used']
         self.model_name = data.get('model_name', self.model_name)
+        self.scaler = data.get('scaler')
         logger.info(f"Model loaded from {path}")
 
     def evaluate(self, X_test: pd.DataFrame, y_test: Union[pd.Series, np.ndarray]) -> Dict:

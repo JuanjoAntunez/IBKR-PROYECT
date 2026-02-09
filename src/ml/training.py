@@ -3,7 +3,7 @@ import numpy as np
 from datetime import datetime, timedelta
 import joblib
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Callable
 from loguru import logger
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -22,7 +22,14 @@ class MLTrainer:
         self.config = self.pipeline.config
         self.models = {}
         
-    def train_enhanced_sma(self, symbol: str, start_date: str = None, end_date: str = None):
+    def train_enhanced_sma(
+        self,
+        symbol: str,
+        start_date: str = None,
+        end_date: str = None,
+        fetch_func: Optional[Callable] = None,
+        force_refresh: bool = False,
+    ):
         """
         Train Enhanced SMA Model.
         Target: 1 if SMA crossover logic would be profitable in next N days.
@@ -30,7 +37,14 @@ class MLTrainer:
         logger.info(f"Starting training Enhanced SMA for {symbol}")
         
         # 1. Load Data (Daily)
-        df = self.pipeline.get_data(symbol, "1d", start_date=pd.to_datetime(start_date), end_date=pd.to_datetime(end_date))
+        df = self.pipeline.get_data(
+            symbol,
+            "1d",
+            start_date=pd.to_datetime(start_date),
+            end_date=pd.to_datetime(end_date),
+            fetch_func=fetch_func,
+            force_refresh=force_refresh,
+        )
         if df.empty:
             logger.error("No data found")
             return
@@ -70,9 +84,15 @@ class MLTrainer:
         X_train, y_train = splits['train']
         X_val, y_val = splits['val']
         X_test, y_test = splits['test']
-        
+
+        scale = self.config.get("training", {}).get("scale", False)
+        if scale:
+            X_train, X_val, X_test = self.pipeline.scale_data(X_train, X_val, X_test)
+
         # 3. Initialize Model
         model = EnhancedSMAModel(self.config.get("strategies", {}).get("enhanced_sma", {}))
+        if scale:
+            model.scaler = self.pipeline.scaler
         
         # 4. Train
         metrics = model.train(X_train, y_train)
@@ -87,14 +107,25 @@ class MLTrainer:
         
         return eval_metrics
 
-    def train_intraday_predictor(self, symbol: str, timeframe: str = "15 mins"):
+    def train_intraday_predictor(
+        self,
+        symbol: str,
+        timeframe: str = "15 mins",
+        fetch_func: Optional[Callable] = None,
+        force_refresh: bool = False,
+    ):
         """
         Train Intraday Predictor.
         """
         logger.info(f"Starting training Intraday Predictor for {symbol} {timeframe}")
         
         # Load
-        df = self.pipeline.get_data(symbol, timeframe)
+        df = self.pipeline.get_data(
+            symbol,
+            timeframe,
+            fetch_func=fetch_func,
+            force_refresh=force_refresh,
+        )
         if df.empty:
             logger.error("No data")
             return
@@ -104,8 +135,15 @@ class MLTrainer:
         splits = self.pipeline.split_data(X, y)
         X_train, y_train = splits['train']
         X_test, y_test = splits['test']
+
+        scale = self.config.get("training", {}).get("scale", False)
+        if scale:
+            # Reuse val slot for scaling
+            X_train, _X_val, X_test = self.pipeline.scale_data(X_train, X_test, X_test)
         
         model = IntradayPredictor(self.config.get("strategies", {}).get("intraday_prediction", {}))
+        if scale:
+            model.scaler = self.pipeline.scaler
         
         model.train(X_train, y_train)
         eval_metrics = model.evaluate(X_test, y_test)

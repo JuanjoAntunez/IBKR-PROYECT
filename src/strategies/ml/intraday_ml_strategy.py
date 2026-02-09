@@ -20,21 +20,24 @@ class IntradayMLStrategy(BaseStrategy):
         super().__init__(config)
         self.ml_engine = ml_engine
         self.timeframe = timeframe
-        self.symbol = self.symbols[0]
-        self.model_key = f"intraday_{self.symbol}_{self.timeframe.replace(' ', '')}"
+
+    def _model_key(self, symbol: str) -> str:
+        return f"intraday_{symbol}_{self.timeframe.replace(' ', '')}"
         
     def calculate_signals(self, data: pd.DataFrame) -> List[Signal]:
         signals: List[Signal] = []
         if data.empty:
             return signals
             
+        symbol = data["symbol"].iloc[0] if "symbol" in data.columns else self.symbols[0]
+
         # Query ML
-        pred = self.ml_engine.get_prediction(self.model_key, data)
+        pred = self.ml_engine.get_prediction(self._model_key(symbol), data)
         if "error" in pred:
             return signals
             
         pred_price = pred.get("prediction")
-        current_price = data['close'].iloc[-1]
+        current_price = data["close"].iloc[-1]
         
         pct_change = (pred_price - current_price) / current_price
         
@@ -42,23 +45,24 @@ class IntradayMLStrategy(BaseStrategy):
         sell_thresh = -0.005
         
         if pct_change > buy_thresh:
-            if not self.has_position(self.symbol):
+            if not self.has_position(symbol):
+                 confidence = min(1.0, max(0.0, abs(pct_change)))
                  signal = Signal(
-                    symbol=self.symbol,
+                    symbol=symbol,
                     signal_type=SignalType.BUY,
                     timestamp=datetime.now(),
                     price=current_price,
                     quantity=100, # Sizing logic
-                    confidence=abs(pct_change)*100, # scaled
+                    confidence=confidence,
                     metadata={"pred_price": pred_price}
                 )
                  signals.append(signal)
         
         elif pct_change < sell_thresh:
-             if self.has_position(self.symbol):
+             if self.has_position(symbol):
                  # Close long or Open Short
                  signal = Signal(
-                    symbol=self.symbol,
+                    symbol=symbol,
                     signal_type=SignalType.CLOSE_LONG, # or SHORT
                     timestamp=datetime.now(),
                     price=current_price,

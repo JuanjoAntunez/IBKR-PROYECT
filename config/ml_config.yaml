@@ -50,6 +50,7 @@ training:
   lookback_years: 2  # For daily models
   lookback_days: 90  # For intraday models
   retrain_schedule: "weekly"  # daily, weekly, monthly
+  scale: true  # Apply feature scaling and persist scaler with the model
   
 # Hyperparameters (Defaults)
 models:
